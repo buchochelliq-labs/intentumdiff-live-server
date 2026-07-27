@@ -1,0 +1,9 @@
+/target/
+*.orig
+*.pyd
+__pycache__/
+vendor/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

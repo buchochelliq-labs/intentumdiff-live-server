@@ -1,0 +1,34 @@
+# The native IntentDiff live-server (#100, A2.5 Phase B): a standalone binary that links
+# the PURE-RUST engine (intentdiff-rust-core with default-features = false — no pyo3, no
+# libpython) and speaks the live-diff JSON-line protocol. Extracted to the
+# `intentdiff-live-server` repo at the split (#82). Standalone package (excluded from the
+# root workspace, like the core) so its [patch]/[profile] sections apply.
+
+[package]
+name = "intentdiff-live-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Native IntentDiff live-server: keystroke-level diff/review over the JSON-line protocol"
+license = "MIT"
+
+[[bin]]
+name = "intentdiff-live-server"
+path = "src/main.rs"
+
+[dependencies]
+# default-features = false -> the pure-Rust engine (the `python` pyo3 feature stays off).
+intentdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentdiff-core", tag = "v0.1.0", default-features = false }
+serde_json = "1"
+
+# Same first-party patches the core's build uses (patch sections apply at the consuming
+# package root, so they must be repeated here).
+[patch.crates-io]
+quote = { path = "patches/quote" }
+zmij = { path = "patches/zmij" }
+serde_core = { path = "patches/serde_core" }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+strip = true
