@@ -1,14 +1,14 @@
-# Building intentdiff-live-server
+# Building intentumdiff-live-server
 
 Toolchain: **Rust 1.93.0**.
 
 ```bash
-cargo build --release      # -> target/release/intentdiff-live-server
+cargo build --release      # -> target/release/intentumdiff-live-server
 cargo test
 ```
 
 The engine dependency is a git dep on
-[intentdiff-core](https://github.com/buchochelliq-labs/intentdiff-core) pinned by tag; for a
+[intentumdiff-core](https://github.com/buchochelliq-labs/intentumdiff-core) pinned by tag; for a
 private clone set `CARGO_NET_GIT_FETCH_WITH_CLI=true`. Parser components are resolved at
-runtime from the wasm dir the spawning editor supplies (`$INTENTDIFF_WASM_DIR` or a directory
+runtime from the wasm dir the spawning editor supplies (`$INTENTUMDIFF_WASM_DIR` or a directory
 beside the binary).

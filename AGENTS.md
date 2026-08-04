@@ -1,9 +1,9 @@
-# Agent instructions — intentdiff-live-server
+# Agent instructions — intentumdiff-live-server
 
 The native editor IPC server. Transport ONLY — diff/review compute is engine handlers.
 
 ## Hard invariants
-- Protocol semantics change in intentdiff-core's live_*_impl, never here.
+- Protocol semantics change in intentumdiff-core's live_*_impl, never here.
 - Windows named pipe keeps its owner-only DACL; requests stay bounded; malformed input gets
   a structured error response, never a crash.
 

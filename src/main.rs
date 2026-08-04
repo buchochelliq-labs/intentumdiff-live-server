@@ -1,8 +1,8 @@
-//! Native IntentDiff live-server (#100, A2.5 Phase B — first cut): the stdio transport.
+//! Native IntentumDiff live-server (#100, A2.5 Phase B — first cut): the stdio transport.
 //!
-//! Links the PURE-RUST engine (`intentdiff-rust-core` with `default-features = false` — no
+//! Links the PURE-RUST engine (`intentumdiff-rust-core` with `default-features = false` — no
 //! pyo3, no libpython anywhere in the process) and speaks the same JSON-line protocol v2 as
-//! the Python `intentdiff live-server`: a `ready` line on startup, then one response (or
+//! the Python `intentumdiff live-server`: a `ready` line on startup, then one response (or
 //! error) per request line for `hello` / `diff` / `review` / `cancel`, with the same
 //! validation/limits/capabilities (all shared with the Python server via the engine's
 //! `live_server` protocol impls — the wire contract is defined ONCE).
@@ -22,7 +22,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use intentdiff_rust_core::live_server as proto;
+use intentumdiff_rust_core::live_server as proto;
 use serde_json::{json, Value};
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
@@ -32,9 +32,9 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-/// The repo path, CLI-compatible with the Python `intentdiff live-server` invocation the VS Code
+/// The repo path, CLI-compatible with the Python `intentumdiff live-server` invocation the VS Code
 /// extension builds (`buildLiveServerArgs`): `<exe> live-server <workspaceRoot> --stdio --ref R
-/// --debounce S [--fuel N]`. The binary is a drop-in — pointing the `intentdiff.executable`
+/// --debounce S [--fuel N]`. The binary is a drop-in — pointing the `intentumdiff.executable`
 /// setting at it is the whole cutover. A leading `live-server` token is skipped; the first
 /// non-flag positional is the repo; `--repo <path>` also works (this binary's native flag).
 fn repo_from_args(args: &[String]) -> Option<String> {
@@ -75,16 +75,16 @@ fn dir_has_manifest(dir: &std::path::Path) -> bool {
 }
 
 /// Bundled-parser dir, ZERO-SETUP by design (a GUI-launched VS Code passes no env vars — the
-/// first side-by-side failed on exactly that): `--wasm-dir` flag > `INTENTDIFF_WASM_DIR` env >
+/// first side-by-side failed on exactly that): `--wasm-dir` flag > `INTENTUMDIFF_WASM_DIR` env >
 /// `<exe dir>/wasm` (the split-repo shipping shape) > DEV-LAYOUT auto-detection (walk the exe's
-/// ancestors for `src/intentdiff/wasm` — finds the monorepo wasm when the exe runs from
+/// ancestors for `src/intentumdiff/wasm` — finds the monorepo wasm when the exe runs from
 /// `crates/live-server/target/<profile>/`). Every candidate is verified by the presence of
 /// `parser_manifest.json`, never guessed from a bare directory.
 fn resolve_wasm_dir(args: &[String]) -> String {
     if let Some(dir) = arg_value(args, "--wasm-dir") {
         return dir;
     }
-    if let Ok(dir) = std::env::var("INTENTDIFF_WASM_DIR") {
+    if let Ok(dir) = std::env::var("INTENTUMDIFF_WASM_DIR") {
         if !dir.trim().is_empty() {
             return dir;
         }
@@ -96,7 +96,7 @@ fn resolve_wasm_dir(args: &[String]) -> String {
                 return shipped.to_string_lossy().into_owned();
             }
             for ancestor in exe_dir.ancestors() {
-                let dev = ancestor.join("src").join("intentdiff").join("wasm");
+                let dev = ancestor.join("src").join("intentumdiff").join("wasm");
                 if dir_has_manifest(&dev) {
                     return dev.to_string_lossy().into_owned();
                 }
@@ -126,7 +126,7 @@ fn main() {
     let default_ref = arg_value(&args, "--ref").unwrap_or_else(|| "HEAD".to_owned());
     let wasm_dir = resolve_wasm_dir(&args);
     // Engine config, matching the Python server's `_load_cli_config(config_start_path=repo)`
-    // exactly: an explicit --config-json wins; otherwise the repo's intentdiff.yaml `config:`
+    // exactly: an explicit --config-json wins; otherwise the repo's intentumdiff.yaml `config:`
     // section loads natively (#99 loader), with the extension CLI's --fuel overriding plugin_fuel
     // on top. A malformed config file degrades to defaults WITH a ready-line warning (the Python
     // CLI exits instead; a keystroke server staying alive with a loud warning is kinder).
@@ -136,11 +136,11 @@ fn main() {
     let (config_json, config_source) = match arg_value(&args, "--config-json") {
         Some(explicit) => (explicit, "flag"),
         None => match proto::live_load_project_config_impl(&repo) {
-            Ok(loaded) if loaded.trim() != "{}" => (loaded, "intentdiff.yaml"),
+            Ok(loaded) if loaded.trim() != "{}" => (loaded, "intentumdiff.yaml"),
             Ok(_) => ("{}".to_owned(), "defaults"),
             Err(e) => {
                 config_warnings.push(format!(
-                    "intentdiff.yaml config not loaded ({e}); using engine defaults"
+                    "intentumdiff.yaml config not loaded ({e}); using engine defaults"
                 ));
                 ("{}".to_owned(), "defaults")
             }
@@ -163,7 +163,7 @@ fn main() {
     let mut ready_warnings = config_warnings.clone();
     if wasm_dir.is_empty() {
         ready_warnings.push(
-            "bundled parsers NOT FOUND: pass --wasm-dir or set INTENTDIFF_WASM_DIR \
+            "bundled parsers NOT FOUND: pass --wasm-dir or set INTENTUMDIFF_WASM_DIR \
              (exe-adjacent wasm/ and dev-layout auto-detection both failed); every \
              diff/review will fail with wasm_dir_missing"
                 .to_owned(),
@@ -245,7 +245,7 @@ fn main() {
                 &error_response(
                     seq,
                     "wasm_dir_missing",
-                    "bundled parsers not found: pass --wasm-dir or set INTENTDIFF_WASM_DIR \
+                    "bundled parsers not found: pass --wasm-dir or set INTENTUMDIFF_WASM_DIR \
                      (exe-adjacent wasm/ and dev-layout auto-detection failed)",
                     op,
                 ),

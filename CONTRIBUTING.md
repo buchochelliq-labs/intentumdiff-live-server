@@ -1,4 +1,4 @@
-# Contributing to intentdiff-live-server
+# Contributing to intentumdiff-live-server
 
 - This repo owns **transport only** (sockets/pipes, framing, lifecycle). Diff/review compute
   lives in the engine's `live_*_impl` handlers — protocol semantics change there, not here.

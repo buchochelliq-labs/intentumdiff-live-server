@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-/// The dev-layout wasm dir (walk ancestors for `src/intentdiff/wasm`), manifest-verified.
+/// The dev-layout wasm dir (walk ancestors for `src/intentumdiff/wasm`), manifest-verified.
 fn find_wasm_dir() -> Option<PathBuf> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for ancestor in manifest.ancestors() {
-        let dev = ancestor.join("src").join("intentdiff").join("wasm");
+        let dev = ancestor.join("src").join("intentumdiff").join("wasm");
         if dev.join("parser_manifest.json").is_file() {
             return Some(dev);
         }
@@ -51,7 +51,7 @@ fn unique_temp_dir() -> PathBuf {
         .unwrap()
         .as_nanos();
     let dir =
-        std::env::temp_dir().join(format!("intentdiff-live-it-{}-{nanos}", std::process::id()));
+        std::env::temp_dir().join(format!("intentumdiff-live-it-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -125,7 +125,7 @@ fn native_live_server_serves_the_protocol() {
         eprintln!("skipping: git not available");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_intentdiff-live-server");
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-live-server");
 
     let base = unique_temp_dir();
     let repo = base.join("repo");

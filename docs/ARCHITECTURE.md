@@ -1,10 +1,10 @@
-# intentdiff-live-server architecture
+# intentumdiff-live-server architecture
 
 The native keystroke-level diff/review IPC server editors spawn. Modeled as an **in-process
 consumer of the engine** — "a binding that speaks sockets instead of function calls": it links
-[intentdiff-core](https://github.com/buchochelliq-labs/intentdiff-core) as a Rust rlib
+[intentumdiff-core](https://github.com/buchochelliq-labs/intentumdiff-core) as a Rust rlib
 (`default-features = false`) and calls the same `live_*_impl` handlers the
-[C ABI](https://github.com/buchochelliq-labs/intentdiff-core/blob/main/docs/C_ABI.md) exposes.
+[C ABI](https://github.com/buchochelliq-labs/intentumdiff-core/blob/main/docs/C_ABI.md) exposes.
 No IPC round-trip ever re-implements semantics.
 
 ## Transport
@@ -24,5 +24,5 @@ request parsing and responses are engine handlers, so every consumer (this serve
 the language bindings) serves identical results.
 
 The VS Code extension bundles this binary and spawns it
-([intentdiff-vscode](https://github.com/buchochelliq-labs/intentdiff-vscode)); any other
+([intentumdiff-vscode](https://github.com/buchochelliq-labs/intentumdiff-vscode)); any other
 editor can do the same.
