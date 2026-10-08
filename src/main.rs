@@ -159,7 +159,8 @@ fn main() {
     let mut out = stdout.lock();
 
     let limits = parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
-    let capabilities = parse_json(&proto::live_capabilities_impl()).unwrap_or_else(|| json!({}));
+    let capabilities =
+        parse_json(&proto::live_native_capabilities_impl()).unwrap_or_else(|| json!({}));
     let mut ready_warnings = config_warnings.clone();
     if wasm_dir.is_empty() {
         ready_warnings.push(
@@ -264,7 +265,7 @@ fn main() {
                     "repo_path": repo,
                     "ref": default_ref,
                     "limits": parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({})),
-                    "capabilities": parse_json(&proto::live_capabilities_impl())
+                    "capabilities": parse_json(&proto::live_native_capabilities_impl())
                         .unwrap_or_else(|| json!({})),
                 }),
             ),
@@ -272,11 +273,29 @@ fn main() {
                 &mut out,
                 &json!({ "op": "cancel", "seq": seq, "ok": true, "cancelled": 0 }),
             ),
+            "asset_diff" => {
+                let response = proto::live_handle_asset_diff_impl(&repo, &default_ref, &line, seq);
+                match parse_json(&response) {
+                    Some(value) => write_line(&mut out, &value),
+                    None => write_line(
+                        &mut out,
+                        &error_response(
+                            seq,
+                            "asset_error",
+                            "engine returned invalid JSON",
+                            "asset_diff",
+                        ),
+                    ),
+                }
+            }
             "diff" => {
                 let parsed = match proto::live_parse_diff_request_impl(&line, &default_ref) {
                     Ok(p) => p,
                     Err(e) => {
-                        write_line(&mut out, &error_response(seq, "invalid_request", &e, "diff"));
+                        write_line(
+                            &mut out,
+                            &error_response(seq, "invalid_request", &e, "diff"),
+                        );
                         continue;
                     }
                 };
@@ -302,7 +321,12 @@ fn main() {
                     .unwrap_or(&default_ref);
                 let start = std::time::Instant::now();
                 match proto::live_handle_diff_impl(
-                    &repo, path, git_ref, content, &config_json, &wasm_dir,
+                    &repo,
+                    path,
+                    git_ref,
+                    content,
+                    &config_json,
+                    &wasm_dir,
                 ) {
                     Ok(result) => {
                         let result: Value = parse_json(&result).unwrap_or_else(|| json!({}));
@@ -347,9 +371,7 @@ fn main() {
                             );
                         }
                     }
-                    Err(e) => {
-                        write_line(&mut out, &error_response(seq, "diff_error", &e, "diff"))
-                    }
+                    Err(e) => write_line(&mut out, &error_response(seq, "diff_error", &e, "diff")),
                 }
             }
             "review" => {
@@ -372,7 +394,12 @@ fn main() {
                     None => {
                         write_line(
                             &mut out,
-                            &error_response(seq, "invalid_request", "unparseable request", "review"),
+                            &error_response(
+                                seq,
+                                "invalid_request",
+                                "unparseable request",
+                                "review",
+                            ),
                         );
                         continue;
                     }
@@ -383,7 +410,11 @@ fn main() {
                     .unwrap_or(&default_ref);
                 let new_ref = parsed.get("new_ref").and_then(Value::as_str).unwrap_or("");
                 match proto::live_handle_review_impl(
-                    &repo, old_ref, new_ref, &config_json, &wasm_dir,
+                    &repo,
+                    old_ref,
+                    new_ref,
+                    &config_json,
+                    &wasm_dir,
                 ) {
                     Ok(result) => {
                         let result: Value = parse_json(&result).unwrap_or_else(|| json!({}));
@@ -407,7 +438,11 @@ fn main() {
                                     "commit_diff": commit_diff,
                                     "metadata": {
                                         "file_count": file_count,
-                                        "guardrail_violation_count": 0,
+                                        "guardrail_violation_count": commit_diff
+                                            .get("guardrail_violations")
+                                            .and_then(Value::as_array)
+                                            .map(|violations| violations.len())
+                                            .unwrap_or(0),
                                         "cross_file_change_count": cross_count,
                                         "streamed": false,
                                     },

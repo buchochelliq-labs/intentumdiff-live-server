@@ -1,8 +1,8 @@
 //! End-to-end regression test for the native live-server (#100): spawn the built binary and
 //! drive a full JSON-line protocol-v2 session over stdio, asserting the wire contract the VS
 //! Code extension depends on — `ready`, `hello`, `diff`, `review`, `cancel`, clean EOF exit.
-//! Self-contained (shells out to `git`, no Python); skips (passes with a note) when the
-//! bundled wasm parsers or `git` are unavailable.
+//! Self-contained (shells out to `git`, no Python); fails closed when verified
+//! bundled Wasm parsers or `git` are unavailable.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,14 @@ use serde_json::{json, Value};
 
 /// The dev-layout wasm dir (walk ancestors for `src/intentumdiff/wasm`), manifest-verified.
 fn find_wasm_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("INTENTUMDIFF_TEST_WASM_DIR") {
+        let path = PathBuf::from(dir);
+        assert!(
+            path.join("parser_manifest.json").is_file(),
+            "test parser manifest missing"
+        );
+        return Some(path);
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for ancestor in manifest.ancestors() {
         let dev = ancestor.join("src").join("intentumdiff").join("wasm");
@@ -50,8 +58,10 @@ fn unique_temp_dir() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("intentumdiff-live-it-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "intentumdiff-live-it-{}-{nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -117,14 +127,9 @@ fn spawn(bin: &str, repo: &Path, wasm_dir: &Path) -> Session {
 
 #[test]
 fn native_live_server_serves_the_protocol() {
-    let Some(wasm_dir) = find_wasm_dir() else {
-        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
-        return;
-    };
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return;
-    }
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    assert!(git_available(), "git is required for protocol verification");
     let bin = env!("CARGO_BIN_EXE_intentumdiff-live-server");
 
     let base = unique_temp_dir();
@@ -148,11 +153,18 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(ready["protocol_version"], 2);
     assert_eq!(ready["transport"], "stdio");
     assert_eq!(ready["ref"], "HEAD");
-    assert!(ready["wasm_dir"].is_string(), "wasm_dir should be resolved: {ready}");
+    assert!(
+        ready["wasm_dir"].is_string(),
+        "wasm_dir should be resolved: {ready}"
+    );
     assert!(
         ready["capabilities"]["review"].as_bool().unwrap_or(false),
         "review capability should be advertised: {ready}"
     );
+
+    assert_eq!(ready["capabilities"]["stream"], false);
+    assert_eq!(ready["capabilities"]["review_streaming"], false);
+    assert_eq!(ready["capabilities"]["edit_deltas"], false);
 
     // 2. hello echoes the protocol handshake.
     s.send(&json!({"op": "hello", "seq": 1}));
@@ -178,7 +190,10 @@ fn native_live_server_serves_the_protocol() {
         .iter()
         .filter_map(|c| c["change_type"].as_str())
         .collect();
-    assert!(change_types.contains(&"MODIFICATION"), "got {change_types:?}");
+    assert!(
+        change_types.contains(&"MODIFICATION"),
+        "got {change_types:?}"
+    );
 
     // 4. A working-tree review (old_ref HEAD, no new_ref = the extension's default).
     s.send(&json!({"op": "review", "seq": 3, "old_ref": "HEAD"}));
@@ -200,10 +215,107 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(cancel["op"], "cancel");
     assert_eq!(cancel["ok"], true);
 
+    std::fs::write(repo.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
+    git(&repo, &["add", "card.png"]);
+    git(&repo, &["commit", "-m", "image base"]);
+    std::fs::write(repo.join("card.png"), include_bytes!("fixtures/after.png")).unwrap();
+    s.send(&json!({"op": "asset_diff", "seq": 5, "path": "card.png"}));
+    let asset = s.recv();
+    assert_eq!(
+        asset["op"], "asset_diff",
+        "asset operation must be dispatched: {asset}"
+    );
+    assert_eq!(asset["ok"], true, "{asset}");
+    assert_eq!(asset["result"]["status"], "compared");
+    for layer in [
+        "before",
+        "after",
+        "diff",
+        "heatmap",
+        "mask",
+        "overlay",
+        "contact_sheet",
+    ] {
+        let path = Path::new(
+            asset["result"]["artifacts"][layer]
+                .as_str()
+                .expect("artifact path"),
+        );
+        assert!(path.is_file(), "missing artifact {layer}");
+        assert!(
+            path.starts_with(repo.join(".intentumdiff-cache")),
+            "artifact escaped cache"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(repo.join(".intentumdiff-cache/.gitignore"))
+            .unwrap()
+            .contains('*')
+    );
+    s.send(&json!({"op": "asset_diff", "seq": 6, "path": "../outside.png"}));
+    let asset = s.recv();
+    assert_eq!(
+        asset["op"], "asset_diff",
+        "asset operation must be dispatched: {asset}"
+    );
+    assert_eq!(asset["ok"], false);
+    assert_eq!(asset["error"]["code"], "invalid_request");
+
     // 6. Clean shutdown on stdin EOF (#73).
     drop(s.stdin);
     let status = s.child.wait().expect("wait");
     assert!(status.success(), "clean exit expected, got {status:?}");
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn native_review_preserves_mixed_code_and_image_changes() {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    assert!(git_available(), "git is required for protocol verification");
+    let base = unique_temp_dir();
+    git(&base, &["init"]);
+    git(&base, &["config", "user.email", "t@example.com"]);
+    git(&base, &["config", "user.name", "T"]);
+    std::fs::write(base.join("a.ts"), "const x: number = 1;\n").unwrap();
+    std::fs::write(base.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
+    git(&base, &["add", "."]);
+    git(&base, &["commit", "-m", "mixed base"]);
+    std::fs::write(base.join("a.ts"), "const x: number = 2;\n").unwrap();
+    std::fs::write(base.join("card.png"), include_bytes!("fixtures/after.png")).unwrap();
+    let mut session = spawn(
+        env!("CARGO_BIN_EXE_intentumdiff-live-server"),
+        &base,
+        &wasm_dir,
+    );
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD"}));
+    let response = session.recv();
+    assert_eq!(
+        response["ok"], true,
+        "mixed review must preserve code and assets: {response}"
+    );
+    let files = response["commit_diff"]["file_diffs"]
+        .as_array()
+        .expect("file diffs");
+    assert!(
+        files.iter().any(|file| file["new_filename"] == "a.ts"),
+        "missing code: {response}"
+    );
+    // Both Python and native text review skip binary bytes. VS Code requests the
+    // image separately from its Git snapshot; exercise that same wire contract.
+    session.send(&json!({"op": "asset_diff", "seq": 2, "path": "card.png", "ref": "HEAD"}));
+    let image = session.recv();
+    assert_eq!(image["ok"], true, "mixed image review failed: {image}");
+    assert_eq!(image["result"]["status"], "compared");
+    assert!(
+        image["result"]["changed_pixel_percentage"]
+            .as_f64()
+            .unwrap_or_default()
+            > 0.0
+    );
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(base);
 }
