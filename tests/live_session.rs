@@ -319,3 +319,83 @@ fn native_review_preserves_mixed_code_and_image_changes() {
     assert!(session.child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(base);
 }
+
+fn assert_incomplete_git_review(name: &str, old: &str, new: &str, offset: i64) {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let bin = std::env::var("INTENTUMDIFF_TEST_LIVE_SERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentumdiff-live-server").to_owned());
+    {
+        let repo = unique_temp_dir();
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join(name), old).unwrap();
+        git(&repo, &["add", name]);
+        git(&repo, &["commit", "-m", "incomplete baseline"]);
+        std::fs::write(repo.join(name), new).unwrap();
+        let mut session = spawn(&bin, &repo, &wasm_dir);
+        assert_eq!(session.recv()["op"], "ready");
+        session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD", "stream": false}));
+        let response = session.recv();
+        assert_eq!(
+            response["ok"], true,
+            "{name} Git review must return source evidence: {response}"
+        );
+        let files = response["commit_diff"]["file_diffs"]
+            .as_array()
+            .expect("file diffs");
+        let diff = files
+            .iter()
+            .find(|file| file["new_filename"] == name)
+            .expect("incomplete file in review");
+        assert_eq!(diff["metadata"]["engine_owner"], "rust");
+        assert_eq!(
+            diff["metadata"]["semantic_contract"],
+            "rust_source_fallback_v1"
+        );
+        assert_eq!(diff["is_fallback"], true);
+        assert_eq!(diff["is_style_only"], false);
+        assert!(!diff["parse_errors"]
+            .as_array()
+            .expect("parse warnings")
+            .is_empty());
+        assert_eq!(diff["changes"].as_array().expect("changes").len(), 1);
+        assert_eq!(diff["changes"][0]["old_node"]["label"], "f");
+        assert_eq!(diff["changes"][0]["new_node"]["label"], "g");
+        assert_eq!(
+            diff["metadata"]["source_ranges"],
+            json!({
+                "old_start_byte": offset, "old_end_byte": offset + 1,
+                "new_start_byte": offset, "new_end_byte": offset + 1,
+            })
+        );
+        assert_eq!(diff["changes"][0]["old_node"]["position"]["start_line"], 0);
+        assert_eq!(diff["changes"][0]["new_node"]["position"]["start_line"], 0);
+        assert_eq!(
+            diff["changes"][0]["old_node"]["position"]["start_col"],
+            offset
+        );
+        assert_eq!(
+            diff["changes"][0]["new_node"]["position"]["start_col"],
+            offset
+        );
+        for side in ["old_node", "new_node"] {
+            assert_eq!(diff["changes"][0][side]["position"]["end_line"], 0);
+            assert_eq!(diff["changes"][0][side]["position"]["end_col"], offset + 1);
+        }
+        drop(session.stdin);
+        assert!(session.child.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+}
+
+#[test]
+fn native_git_review_preserves_incomplete_python_evidence() {
+    assert_incomplete_git_review("edit.py", "def f(", "def g(", 4);
+}
+
+#[test]
+fn native_git_review_preserves_incomplete_javascript_evidence() {
+    assert_incomplete_git_review("edit.js", "function f(", "function g(", 9);
+}
