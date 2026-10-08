@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "release/**", "codex/**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,7 +13,7 @@ jobs:
   build-and-test:
     name: Build + tests
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -21,8 +22,6 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
           toolchain: 1.95.0
-      - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
       # Phase D: the git dep on the private intentumdiff-core needs an org token wired
       # (CARGO_NET_GIT_FETCH_WITH_CLI + a checkout credential) before this job can run.
       - name: Authenticate cross-repo git deps
@@ -40,9 +39,34 @@ jobs:
             echo "::warning::SPLIT_REPO_TOKEN not set - private cross-repo dependencies will fail to fetch"
           fi
 
+      - name: Provision checksum-verified parser components
+        env:
+          GH_TOKEN: ${{ secrets.SPLIT_REPO_TOKEN }}
+        run: python scripts/provision_components.py
+
       - name: Build + test
         run: |
-          cargo build --release
-          cargo test
+          cargo build --locked --release
+          cargo test --locked
+          cargo test --locked --release
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          INTENTUMDIFF_TEST_WASM_DIR: ${{ github.workspace }}/dist/wasm
+
+      - name: Verify native runtime and package tested binary
+        run: |
+          ldd target/release/intentumdiff-live-server > native-linkage.txt
+          if grep -i libpython native-linkage.txt; then
+            echo "Native runtime unexpectedly links Python" >&2
+            exit 1
+          fi
+          python scripts/package_native.py
+          cd artifacts
+          sha256sum --check SHA256SUMS
+
+      - name: Upload tested native runtime
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-linux-x64-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
