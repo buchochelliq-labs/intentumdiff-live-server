@@ -429,6 +429,27 @@ fn main() {
                                 .and_then(Value::as_array)
                                 .map(|a| a.len())
                                 .unwrap_or(0);
+                            // Keep engine-owned request metadata (including review fuel policy)
+                            // and supplement it with this transport's response summary.
+                            let mut metadata = result
+                                .get("metadata")
+                                .and_then(Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            metadata.entry("file_count").or_insert(json!(file_count));
+                            metadata
+                                .entry("guardrail_violation_count")
+                                .or_insert_with(|| {
+                                    json!(commit_diff
+                                        .get("guardrail_violations")
+                                        .and_then(Value::as_array)
+                                        .map(|values| values.len())
+                                        .unwrap_or(0))
+                                });
+                            metadata
+                                .entry("cross_file_change_count")
+                                .or_insert(json!(cross_count));
+                            metadata.insert("streamed".to_owned(), json!(false));
                             write_line(
                                 &mut out,
                                 &json!({
@@ -436,16 +457,7 @@ fn main() {
                                     "seq": seq,
                                     "ok": true,
                                     "commit_diff": commit_diff,
-                                    "metadata": {
-                                        "file_count": file_count,
-                                        "guardrail_violation_count": commit_diff
-                                            .get("guardrail_violations")
-                                            .and_then(Value::as_array)
-                                            .map(|violations| violations.len())
-                                            .unwrap_or(0),
-                                        "cross_file_change_count": cross_count,
-                                        "streamed": false,
-                                    },
+                                    "metadata": metadata,
                                 }),
                             );
                         } else {
