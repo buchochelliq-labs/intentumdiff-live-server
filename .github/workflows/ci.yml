@@ -44,44 +44,39 @@ jobs:
           GH_TOKEN: ${{ secrets.SPLIT_REPO_TOKEN }}
         run: python scripts/provision_components.py
 
-      # TEMPORARY RC lock-reconciliation gate: Cargo must resolve the exact new
-      # Rust core and Wasmtime 48.0.7 graph. Publish the result for manual
-      # review/commit, then remove these two steps and rerun --locked CI.
-      - name: Resolve updated native dependency lock for inspection
+      # RC release gate: use the audited dependency graph committed alongside
+      # this workflow. No Cargo update on the runner: --locked must exercise
+      # precisely these reviewed bytes, not a silently regenerated lock.
+      - name: Verify immutable Core/Wasmtime 48 lock and manifest
         run: |
           set -euo pipefail
-          cargo update --manifest-path Cargo.toml -p intentumdiff-rust-core
           python3 - <<'PY'
+          import hashlib
           from pathlib import Path
           import tomllib
-          lock = tomllib.loads(Path("Cargo.lock").read_text())
-          pkgs = lock["package"]
+
+          core = "a7a954bb875d73c132b8d2df6ddb5e3cedddd7a2"
+          expected_lock_sha256 = "f72081c8057e86a5b705099875ceb8681cd04ed28516ff41c879c29478626fe1"
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())
+          actual_rev = manifest["dependencies"]["intentumdiff-rust-core"]["rev"]
+          assert actual_rev == core, f"unexpected Rust Core manifest revision: {actual_rev}"
+          lock_bytes = Path("Cargo.lock").read_bytes()
+          actual_hash = hashlib.sha256(lock_bytes).hexdigest()
+          assert actual_hash == expected_lock_sha256, f"native lockfile changed: {actual_hash}"
+          pkgs = tomllib.loads(lock_bytes.decode("utf-8"))["package"]
+          owned_core = [p for p in pkgs if p["name"] == "intentumdiff-rust-core"]
+          assert len(owned_core) == 1 and core in owned_core[0].get("source", ""), owned_core
           for name in ("wasmtime", "wasmtime-wasi"):
               versions = [p["version"] for p in pkgs if p["name"] == name]
               assert versions == ["48.0.7"], (name, versions)
-          assert not any(p["version"] == "47.0.3" and p["name"].startswith("wasmtime") for p in pkgs)
-          matched = [p for p in pkgs if p["name"] == "intentumdiff-rust-core"]
-          assert len(matched) == 1
-          source = matched[0].get("source", "")
-          assert "a7a954bb875d73c132b8d2df6ddb5e3cedddd7a2" in source, source
+          assert not any(
+              p["name"].startswith("wasmtime") and p["version"] == "47.0.3"
+              for p in pkgs
+          ), "legacy vulnerable Wasmtime package retained"
           PY
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      - name: Retain regenerated native lockfile for exact review
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-core48-lock-candidate-${{ github.sha }}
-          path: Cargo.lock
-          if-no-files-found: error
-
-      # TEMPORARY: transfer the regenerated public lock bytes back into a
-      # reviewed Git blob without granting a PR workflow repository write access.
-      - name: Emit regenerated native lock base64 for exact file reconciliation
-        run: |
-          printf 'NATIVE_LOCK_BEGIN\n'
-          sha256sum Cargo.lock
-          base64 -w 120 Cargo.lock | sed 's/^/LOCK64:/'
-          printf 'NATIVE_LOCK_END\n'
 
       - name: Build + test
         run: |
