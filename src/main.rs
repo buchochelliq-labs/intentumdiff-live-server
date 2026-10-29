@@ -476,7 +476,13 @@ fn main() {
                                 .unwrap_or("engine returned no commit diff");
                             write_line(
                                 &mut out,
-                                &error_response(seq, "native_fallback", reason, "review"),
+                                &error_response(
+                                    seq,
+                                    result.get("fallback_code").and_then(Value::as_str)
+                                        .unwrap_or("native_fallback"),
+                                    reason,
+                                    "review",
+                                ),
                             );
                         }
                     }
