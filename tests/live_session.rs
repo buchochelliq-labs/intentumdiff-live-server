@@ -522,30 +522,23 @@ fn check_native_parser_telemetry_fixture(name: &str, language: &str, old: &str, 
     }
     session.send(&json!({"op":"review", "seq":4, "old_ref":"HEAD", "stream":false}));
     let response = session.recv();
-    assert_eq!(response["ok"], true, "{response}");
-    let diffs = response["commit_diff"]["file_diffs"]
-        .as_array()
-        .expect("review diffs");
-    for (name, language, old, new) in fixtures {
-        let diff = diffs
-            .iter()
-            .find(|diff| diff["new_filename"] == name)
-            .expect("review fixture");
-        assert_measured_parser_telemetry(diff, name, language, old, new);
-        if name == "broken.js" {
-            assert_eq!(diff["is_fallback"], true);
-            assert!(!diff["parse_errors"]
-                .as_array()
-                .expect("parse warnings")
-                .is_empty());
-            assert!(
-                diff["metadata"]["engine_telemetry"]["calls"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|call| call["function"] == "finalize" && call["fuel_consumed"].is_null()),
-                "unmetered source-finalizer evidence must be preserved"
-            );
+    assert_eq!(response["seq"], 4, "{response}");
+    if name == "broken.js" {
+        // Core must reject the entire commit, rather than certifying a
+        // fallback parse and fabricating empty commit-level diagnostics (#193).
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["error"]["code"], "native_parse_incomplete", "{response}");
+        assert!(response["error"]["message"].as_str()
+            .is_some_and(|message| message.contains("broken.js")), "{response}");
+        assert!(response.get("commit_diff").is_none(), "{response}");
+    } else {
+        assert_eq!(response["ok"], true, "{response}");
+        let diffs = response["commit_diff"]["file_diffs"]
+            .as_array().expect("complete review diffs");
+        for (name, language, old, new) in fixtures {
+            let diff = diffs.iter().find(|diff| diff["new_filename"] == name)
+                .expect("review fixture");
+            assert_measured_parser_telemetry(diff, name, language, old, new);
         }
     }
     drop(session.stdin);
