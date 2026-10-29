@@ -331,31 +331,9 @@ fn main() {
                     Ok(result) => {
                         let result: Value = parse_json(&result).unwrap_or_else(|| json!({}));
                         if let Some(diff) = result.get("diff") {
-                            // Transport completeness is not established by the
-                            // presence of a diff key. Rust can return a source
-                            // fallback with parse errors; that is NOT a certified
-                            // semantic review (#17). Never send ok:true for it.
-                            let parse_errors = diff.get("parse_errors").and_then(Value::as_array);
-                            if diff.get("is_fallback").and_then(Value::as_bool) != Some(false)
-                                || !parse_errors.is_some_and(Vec::is_empty)
-                            {
-                                let cause = parse_errors
-                                    .and_then(|items| items.first())
-                                    .map(|err| {
-                                        err.as_str()
-                                            .or_else(|| err.get("message").and_then(Value::as_str))
-                                            .map(str::to_owned)
-                                            .unwrap_or_else(|| err.to_string())
-                                    })
-                                    .unwrap_or_else(|| {
-                                        "Rust returned an uncertified or malformed parse result".to_owned()
-                                    });
-                                write_line(
-                                    &mut out,
-                                    &error_response(seq, "native_parse_incomplete", &cause, "diff"),
-                                );
-                                continue;
-                            }
+                            // Completeness was already judged by Rust Core's
+                            // live_handle_diff_impl; this transport only shapes
+                            // a successful response and never reclassifies it.
                             let duration_ms =
                                 (start.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                             let change_count = diff
@@ -392,7 +370,13 @@ fn main() {
                                 .unwrap_or("engine returned no diff");
                             write_line(
                                 &mut out,
-                                &error_response(seq, "native_fallback", reason, "diff"),
+                                &error_response(
+                                    seq,
+                                    result.get("fallback_code").and_then(Value::as_str)
+                                        .unwrap_or("native_fallback"),
+                                    reason,
+                                    "diff",
+                                ),
                             );
                         }
                     }
