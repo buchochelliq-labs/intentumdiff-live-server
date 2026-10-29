@@ -670,3 +670,48 @@ fn native_explicit_low_fuel_reports_parser_exhaustion() {
     assert!(session.child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(repo);
 }
+
+#[test]
+fn native_diff_rejects_uncertified_parse_fallback_without_lying_about_success() {
+    // A deliberately wrong-grammar .py buffer is still correctly selected as
+    // Python by filename. A Rust diff with parse errors is not a successful
+    // semantic review, even when it contains an unparsed_source addition (#17).
+    let wasm_dir = find_wasm_dir().expect("verified parser manifest is required");
+    assert!(git_available(), "git required for source-judged stdio test");
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-live-server");
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join("README.md"), "baseline\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "baseline"]);
+
+    let mut session = spawn(bin, &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({
+        "op": "diff", "seq": 71, "path": "notebook.py", "ref": "HEAD",
+        "content": "name: etl_job\nparameters:\n  - name: env\n    default: prod\ntasks:\n  - task_key: ingest\n    notebook_task:\n      notebook_path: /notebooks/ingest\n"
+    }));
+    let failed = session.recv();
+    assert_eq!(failed["op"], "diff", "{failed}");
+    assert_eq!(failed["seq"], 71, "{failed}");
+    assert_eq!(failed["ok"], false, "parser fallback is not a certified diff: {failed}");
+    assert!(failed.get("diff").is_none(), "{failed}");
+    assert!(failed["error"]["message"].as_str().is_some_and(|s| !s.is_empty()), "{failed}");
+
+    // Control: the same pinned Rust/Python engine must still serve valid .py.
+    session.send(&json!({
+        "op": "diff", "seq": 72, "path": "example.py", "ref": "HEAD",
+        "content": "answer = 42\n"
+    }));
+    let good = session.recv();
+    assert_eq!(good["seq"], 72);
+    assert_eq!(good["ok"], true, "valid source must remain accepted: {good}");
+    assert_eq!(good["diff"]["is_fallback"], false);
+    assert_eq!(good["diff"]["parse_errors"], json!([]));
+
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
