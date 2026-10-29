@@ -508,8 +508,17 @@ fn check_native_parser_telemetry_fixture(name: &str, language: &str, old: &str, 
     for (index, (name, language, old, new)) in fixtures.iter().enumerate() {
         session.send(&json!({"op":"diff", "seq":index + 1, "path":name, "content":new, "ref":"HEAD", "stream":false}));
         let response = session.recv();
-        assert_eq!(response["ok"], true, "{response}");
-        assert_measured_parser_telemetry(&response["diff"], name, language, old, new);
+        if *name == "broken.js" {
+            // A parse-error/fallback is never a certified direct diff.
+            // Keep the real parser fuel/telemetry checks in the review
+            // assertion below; do not restore the old fail-open ok:true.
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["error"]["code"], "native_parse_incomplete", "{response}");
+            assert!(response.get("diff").is_none(), "{response}");
+        } else {
+            assert_eq!(response["ok"], true, "{response}");
+            assert_measured_parser_telemetry(&response["diff"], name, language, old, new);
+        }
     }
     session.send(&json!({"op":"review", "seq":4, "old_ref":"HEAD", "stream":false}));
     let response = session.recv();
