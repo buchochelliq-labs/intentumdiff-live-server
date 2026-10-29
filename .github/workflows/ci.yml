@@ -58,8 +58,8 @@ jobs:
           from pathlib import Path
           import tomllib
 
-          core = "a7a954bb875d73c132b8d2df6ddb5e3cedddd7a2"
-          expected_lock_sha256 = "f72081c8057e86a5b705099875ceb8681cd04ed28516ff41c879c29478626fe1"
+          core = "1be6ebd38435ad2ce4c5125c98cf60d8b8dea49f"
+          expected_lock_sha256 = "979471a20dee7eb808d58998961b29fbe8b354ee0eb595fe149c58d2d2950726"
           manifest = tomllib.loads(Path("Cargo.toml").read_text())
           actual_rev = manifest["dependencies"]["intentumdiff-rust-core"]["rev"]
           assert actual_rev == core, f"unexpected Rust Core manifest revision: {actual_rev}"
