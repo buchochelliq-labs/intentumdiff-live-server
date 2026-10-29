@@ -74,6 +74,15 @@ jobs:
           path: Cargo.lock
           if-no-files-found: error
 
+      # TEMPORARY: transfer the regenerated public lock bytes back into a
+      # reviewed Git blob without granting a PR workflow repository write access.
+      - name: Emit regenerated native lock base64 for exact file reconciliation
+        run: |
+          printf 'NATIVE_LOCK_BEGIN\n'
+          sha256sum Cargo.lock
+          base64 -w 120 Cargo.lock | sed 's/^/LOCK64:/'
+          printf 'NATIVE_LOCK_END\n'
+
       - name: Build + test
         run: |
           cargo build --locked --release
