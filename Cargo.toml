@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 # default-features = false -> the pure-Rust engine (the `python` pyo3 feature stays off).
-intentumdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentumdiff-core", rev = "e766f9b8ae842cb2168cd9142f8a3019a8961255", default-features = false }
+intentumdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentumdiff-core", rev = "d275e3311e7bbf8cac181064559cae8eb6d8f665", default-features = false }
 serde_json = "1"
 
 # Same first-party patches the core's build uses (patch sections apply at the consuming
