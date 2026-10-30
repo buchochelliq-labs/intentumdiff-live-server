@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from provision_components import IDENTITY, provision
+from provision_components import IDENTITY, EXPECTED_WHEEL_PATH, extract_verified_ci_wheel, provision
 
 
 class ProvisionComponentTests(unittest.TestCase):
@@ -89,6 +89,65 @@ class ProvisionComponentTests(unittest.TestCase):
     def test_duplicate_archive_member_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "duplicate Wasm archive member"):
             self.stage(self.wheel(duplicate=True))
+
+
+    @staticmethod
+    def ci_archive(*, python_commit=None, core_commit=None, profile="release",
+                   wheel_path=EXPECTED_WHEEL_PATH, missing=(), duplicate=False):
+        """Synthetic archive proving the three source/profile attestations are mandatory."""
+        wheel = b"synthetic-wheel"
+        evidence = {
+            "evidence/python-tested-commit.txt": (
+                IDENTITY["python_commit"] if python_commit is None else python_commit
+            ),
+            "evidence/core-commit.txt": (
+                IDENTITY["component_core_commit"] if core_commit is None else core_commit
+            ),
+            "evidence/wheel-build-profile.txt": profile,
+        }
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr(wheel_path, wheel)
+            for path, value in evidence.items():
+                if path not in missing:
+                    archive.writestr(path, value + "\n")
+            if duplicate:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    archive.writestr("evidence/python-tested-commit.txt", evidence[
+                        "evidence/python-tested-commit.txt"
+                    ])
+        return output.getvalue()
+
+    def checked_archive(self, archive):
+        with patch.dict(IDENTITY, {
+            "archive_sha256": hashlib.sha256(archive).hexdigest(),
+            "wheel_sha256": hashlib.sha256(b"synthetic-wheel").hexdigest(),
+        }):
+            return extract_verified_ci_wheel(archive)
+
+    def test_ci_archive_requires_actual_tested_merge_commit_and_release_profile(self):
+        self.assertEqual(self.checked_archive(self.ci_archive()), b"synthetic-wheel")
+        invalid = [
+            (self.ci_archive(python_commit="53925bea94ad8663ad350c1c8c96a306af57d5fe"), "python-tested-commit"),
+            (self.ci_archive(core_commit="wrong-core"), "core-commit"),
+            (self.ci_archive(profile="debug"), "wheel-build-profile"),
+            (self.ci_archive(wheel_path="dist/other.whl"), "pinned Linux wheel"),
+            (self.ci_archive(missing=("evidence/python-tested-commit.txt",)), "lacks valid attestation"),
+            (self.ci_archive(duplicate=True), "duplicate CI artifact"),
+        ]
+        for archive, diagnostic in invalid:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    self.checked_archive(archive)
+
+    def test_ci_archive_rejects_checksum_mismatches_before_any_attestation(self):
+        archive = self.ci_archive()
+        with self.assertRaisesRegex(ValueError, "CI artifact checksum mismatch"):
+            extract_verified_ci_wheel(archive)
+        with patch.dict(IDENTITY, {"archive_sha256": hashlib.sha256(archive).hexdigest()}):
+            with self.assertRaisesRegex(ValueError, "reviewed wheel checksum mismatch"):
+                extract_verified_ci_wheel(archive)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ import urllib.parse
 import zipfile
 
 IDENTITY = {
-    "python_commit": "53925bea94ad8663ad350c1c8c96a306af57d5fe",
+    "python_commit": "13d6b36bf220b54f664f20c96e7529010fd28b9c",
     "component_core_commit": "c6612f585d743bb8f6c5aa7797be44bd0263be36",
     "wheel_sha256": "6baaf11f157c2bf5d90fa1cf8a41a43ba03bbcad71ff1ca4b2f7eb82888268c9",
     "artifact_id": 12976252541,
@@ -22,6 +22,38 @@ IDENTITY = {
     "workflow_run": 41046565394,
 }
 
+
+# GitHub PR CI tests the synthetic merge tree, not the branch head.
+# Its evidence/python-tested-commit.txt MUST match IDENTITY.python_commit.
+EXPECTED_WHEEL_PATH = "dist/intentumdiff_python-0.0.2b1-py3-none-linux_x86_64.whl"
+
+
+def extract_verified_ci_wheel(data: bytes) -> bytes:
+    """Attest the downloaded CI archive's source/profile before minting native provenance."""
+    checked(data, IDENTITY["archive_sha256"], "CI artifact")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate CI artifact archive member")
+        wheels = [name for name in names if name.endswith(".whl")]
+        if wheels != [EXPECTED_WHEEL_PATH]:
+            raise ValueError("CI artifact must contain exactly the pinned Linux wheel")
+        expected_evidence = {
+            "evidence/python-tested-commit.txt": IDENTITY["python_commit"],
+            "evidence/core-commit.txt": IDENTITY["component_core_commit"],
+            "evidence/wheel-build-profile.txt": "release",
+        }
+        for name, expected in expected_evidence.items():
+            try:
+                recorded = archive.read(name).decode("utf-8").strip()
+            except (KeyError, UnicodeError) as exc:
+                raise ValueError(f"CI artifact lacks valid attestation {name}") from exc
+            if recorded != expected:
+                raise ValueError(
+                    f"CI artifact attestation mismatch: {name}: "
+                    f"expected {expected!r}, got {recorded!r}"
+                )
+        return checked(archive.read(EXPECTED_WHEEL_PATH), IDENTITY["wheel_sha256"], "reviewed wheel")
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
@@ -112,12 +144,7 @@ def main():
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
                                                       "Accept": "application/vnd.github+json"})
         with urllib.request.build_opener(SafeRedirect()).open(request, timeout=120) as response:
-            data = checked(response.read(), IDENTITY["archive_sha256"], "CI artifact")
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = [name for name in archive.namelist() if name.endswith(".whl")]
-            if len(names) != 1:
-                raise ValueError("expected exactly one reviewed wheel")
-            wheel = archive.read(names[0])
+            wheel = extract_verified_ci_wheel(response.read())
     provision(wheel, args.output)
 
 
