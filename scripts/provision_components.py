@@ -14,12 +14,12 @@ import urllib.parse
 import zipfile
 
 IDENTITY = {
-    "python_commit": "1afb914291118889fb6bdb3f0de7e4276b70d2eb",
-    "component_core_commit": "d275e3311e7bbf8cac181064559cae8eb6d8f665",
-    "wheel_sha256": "df6c0fb4d0bb07fbcfdf3d3355b6f43667b488b9fd651df07457170686b48ce3",
-    "artifact_id": 12955776957,
-    "archive_sha256": "0973dd0706196573c6ad0aa6db039c680ff4b42c4f7f4d68e518e02bc2add613",
-    "workflow_run": 41002663115,
+    "python_commit": "53925bea94ad8663ad350c1c8c96a306af57d5fe",
+    "component_core_commit": "c6612f585d743bb8f6c5aa7797be44bd0263be36",
+    "wheel_sha256": "6baaf11f157c2bf5d90fa1cf8a41a43ba03bbcad71ff1ca4b2f7eb82888268c9",
+    "artifact_id": 12976252541,
+    "archive_sha256": "7974365bdf2c9ba6681e40b3571b9629140ee26a07052352795a26a7aca9f087",
+    "workflow_run": 41046565394,
 }
 
 
