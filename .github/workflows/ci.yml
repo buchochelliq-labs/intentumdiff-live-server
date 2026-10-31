@@ -57,12 +57,14 @@ jobs:
           import hashlib
           from pathlib import Path
           import tomllib
+          from scripts.provision_components import require_matching_native_core
 
           core = "3995930d206c35758ba6525eebce49564c539fe1"
           expected_lock_sha256 = "411411cc223b78f75e9179a4f1463c4d9bfea7f1b48e31169c7d02819256fbc7"
           manifest = tomllib.loads(Path("Cargo.toml").read_text())
           actual_rev = manifest["dependencies"]["intentumdiff-rust-core"]["rev"]
           assert actual_rev == core, f"unexpected Rust Core manifest revision: {actual_rev}"
+          require_matching_native_core(actual_rev)
           lock_bytes = Path("Cargo.lock").read_bytes()
           actual_hash = hashlib.sha256(lock_bytes).hexdigest()
           assert actual_hash == expected_lock_sha256, f"native lockfile changed: {actual_hash}"
