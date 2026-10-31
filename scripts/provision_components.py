@@ -14,13 +14,22 @@ import urllib.parse
 import zipfile
 
 IDENTITY = {
-    "python_commit": "b24fd87f4921488af7f94ef13e91329ace426488",
-    "component_core_commit": "076c382b9fc1eae1d68bfdbc78e58187fdfd1a83",
-    "wheel_sha256": "6d23cb01a04c2c6cbb50927a17a4a5d1929f204de97d16aa902d926cb8a9a927",
-    "artifact_id": 13043287406,
-    "archive_sha256": "04dcd892dfe540073afedf4be5c4d7eefbf4729e25bbc5198dc398c67ec39789",
-    "workflow_run": 41198192027,
+    "python_commit": "f983d22a2a98897acb9b90d6e612f2e3c5563656",
+    "component_core_commit": "3995930d206c35758ba6525eebce49564c539fe1",
+    "wheel_sha256": "db95e59356ca207bc2b1b318ca41443b8ebcc2e852ce53851819a894938ef485",
+    "artifact_id": 13048076548,
+    "archive_sha256": "cab75653420e1dab97f0689d5be25435ff9488683aa3cade910d7b2f10c08929",
+    "workflow_run": 41213109108,
 }
+
+
+def require_matching_native_core(native_core_rev: str) -> None:
+    """Reject a native binary built from a different Rust Core than its verified parser wheel."""
+    if native_core_rev != IDENTITY["component_core_commit"]:
+        raise ValueError(
+            "Native Rust Core revision differs from verified wheel Core revision: "
+            f"native={native_core_rev!r}; wheel={IDENTITY['component_core_commit']!r}"
+        )
 
 
 # GitHub PR CI tests the synthetic merge tree, not the branch head.
