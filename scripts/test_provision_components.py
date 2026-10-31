@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from provision_components import IDENTITY, EXPECTED_WHEEL_PATH, extract_verified_ci_wheel, provision
+from provision_components import IDENTITY, EXPECTED_WHEEL_PATH, extract_verified_ci_wheel, provision, require_matching_native_core
 
 
 class ProvisionComponentTests(unittest.TestCase):
@@ -64,6 +64,13 @@ class ProvisionComponentTests(unittest.TestCase):
                 target = Path(temp) / "wasm"
                 provision(wheel, target)
                 return {p.name for p in target.iterdir()}
+
+    def test_native_core_must_match_the_verified_python_wheel_core(self):
+        require_matching_native_core(IDENTITY["component_core_commit"])
+        with self.assertRaisesRegex(ValueError, "Native Rust Core revision differs"):
+            require_matching_native_core("0" * 40)
+        with self.assertRaisesRegex(ValueError, "Native Rust Core revision differs"):
+            require_matching_native_core("")
 
     def test_valid_pinned_wheel_inventory_stages(self):
         self.assertEqual(
