@@ -14,14 +14,55 @@ import urllib.parse
 import zipfile
 
 IDENTITY = {
-    "python_commit": "d46fd0e8fb3c65bb9d77ab14c95ebcb7c5798d54",
-    "component_core_commit": "89c11a806b3f6368a3f502d77aa35698cdf38cba",
-    "wheel_sha256": "1919afa822f5e5bc9b3106d88a0e08c1795dbdd78da99662625f61e9d503faf5",
-    "artifact_id": 11514272993,
-    "archive_sha256": "9f3f63c54cde55b1e7e0cc55073eb20df28753098d215823510ba692a1b991e0",
-    "workflow_run": 37689207055,
+    "python_commit": "f983d22a2a98897acb9b90d6e612f2e3c5563656",
+    "component_core_commit": "3995930d206c35758ba6525eebce49564c539fe1",
+    "wheel_sha256": "db95e59356ca207bc2b1b318ca41443b8ebcc2e852ce53851819a894938ef485",
+    "artifact_id": 13048076548,
+    "archive_sha256": "cab75653420e1dab97f0689d5be25435ff9488683aa3cade910d7b2f10c08929",
+    "workflow_run": 41213109108,
 }
 
+
+def require_matching_native_core(native_core_rev: str) -> None:
+    """Reject a native binary built from a different Rust Core than its verified parser wheel."""
+    if native_core_rev != IDENTITY["component_core_commit"]:
+        raise ValueError(
+            "Native Rust Core revision differs from verified wheel Core revision: "
+            f"native={native_core_rev!r}; wheel={IDENTITY['component_core_commit']!r}"
+        )
+
+
+# GitHub PR CI tests the synthetic merge tree, not the branch head.
+# Its evidence/python-tested-commit.txt MUST match IDENTITY.python_commit.
+EXPECTED_WHEEL_PATH = "dist/intentumdiff_python-0.0.2b1-py3-none-linux_x86_64.whl"
+
+
+def extract_verified_ci_wheel(data: bytes) -> bytes:
+    """Attest the downloaded CI archive's source/profile before minting native provenance."""
+    checked(data, IDENTITY["archive_sha256"], "CI artifact")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate CI artifact archive member")
+        wheels = [name for name in names if name.endswith(".whl")]
+        if wheels != [EXPECTED_WHEEL_PATH]:
+            raise ValueError("CI artifact must contain exactly the pinned Linux wheel")
+        expected_evidence = {
+            "evidence/python-tested-commit.txt": IDENTITY["python_commit"],
+            "evidence/core-commit.txt": IDENTITY["component_core_commit"],
+            "evidence/wheel-build-profile.txt": "release",
+        }
+        for name, expected in expected_evidence.items():
+            try:
+                recorded = archive.read(name).decode("utf-8").strip()
+            except (KeyError, UnicodeError) as exc:
+                raise ValueError(f"CI artifact lacks valid attestation {name}") from exc
+            if recorded != expected:
+                raise ValueError(
+                    f"CI artifact attestation mismatch: {name}: "
+                    f"expected {expected!r}, got {recorded!r}"
+                )
+        return checked(archive.read(EXPECTED_WHEEL_PATH), IDENTITY["wheel_sha256"], "reviewed wheel")
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
@@ -43,24 +84,52 @@ def checked(data, expected, name):
 def provision(wheel, destination):
     checked(wheel, IDENTITY["wheel_sha256"], "reviewed wheel")
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+        names = [
+            name for name in archive.namelist()
+            if name.startswith("intentumdiff/wasm/") and not name.endswith("/")
+        ]
+        # A dict comprehension would silently discard duplicate archive members.
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate Wasm archive member")
         members = {
             name.removeprefix("intentumdiff/wasm/"): archive.read(name)
-            for name in archive.namelist()
-            if name.startswith("intentumdiff/wasm/") and not name.endswith("/")
+            for name in names
         }
     if any("/" in name or "\\" in name or name in (".", "..") for name in members):
         raise ValueError("unexpected nested component path")
     manifest = json.loads(members["wasm_provenance.json"])
     artifacts = manifest["artifacts"]
     actual = {name for name in members if name.endswith(".wasm")}
-    if actual != set(artifacts) or not actual:
+    if (not isinstance(artifacts, dict) or not artifacts
+            or manifest.get("artifact_count") != len(artifacts)):
+        raise ValueError("invalid component provenance artifact count")
+    if actual != set(artifacts):
         raise ValueError("component manifest does not match archive")
     for name, item in artifacts.items():
         checked(members[name], item["sha256"], name)
         if len(members[name]) != item["size_bytes"]:
             raise ValueError(f"{name} size mismatch")
-    if not json.loads(members["parser_manifest.json"]):
-        raise ValueError("empty parser manifest")
+    # The checksums above establish component-byte integrity, but not that
+    # the parser manifest can resolve its declared languages. Every parser
+    # reference and extension-index target must exist in the SAME pinned wheel.
+    parser_manifest = json.loads(members["parser_manifest.json"])
+    parsers = parser_manifest.get("parsers")
+    extension_index = parser_manifest.get("extension_index")
+    if (parser_manifest.get("schema_version") != 1
+            or not isinstance(parsers, dict) or not parsers
+            or not isinstance(extension_index, dict)):
+        raise ValueError("invalid parser manifest structure")
+    for language, entry in parsers.items():
+        if (not isinstance(entry, dict)
+                or not isinstance(entry.get("wasm"), str)
+                or entry["wasm"] not in actual):
+            raise ValueError(f"parser {language!r} references missing Wasm component")
+    for extension, language in extension_index.items():
+        if (not isinstance(extension, str) or not isinstance(language, str)
+                or language not in parsers):
+            raise ValueError(
+                f"extension {extension!r} references unknown parser {language!r}"
+            )
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
         raise ValueError("component destination must be empty")
@@ -84,12 +153,7 @@ def main():
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
                                                       "Accept": "application/vnd.github+json"})
         with urllib.request.build_opener(SafeRedirect()).open(request, timeout=120) as response:
-            data = checked(response.read(), IDENTITY["archive_sha256"], "CI artifact")
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = [name for name in archive.namelist() if name.endswith(".whl")]
-            if len(names) != 1:
-                raise ValueError("expected exactly one reviewed wheel")
-            wheel = archive.read(names[0])
+            wheel = extract_verified_ci_wheel(response.read())
     provision(wheel, args.output)
 
 

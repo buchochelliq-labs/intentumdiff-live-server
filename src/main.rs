@@ -331,6 +331,9 @@ fn main() {
                     Ok(result) => {
                         let result: Value = parse_json(&result).unwrap_or_else(|| json!({}));
                         if let Some(diff) = result.get("diff") {
+                            // Completeness was already judged by Rust Core's
+                            // live_handle_diff_impl; this transport only shapes
+                            // a successful response and never reclassifies it.
                             let duration_ms =
                                 (start.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                             let change_count = diff
@@ -367,7 +370,13 @@ fn main() {
                                 .unwrap_or("engine returned no diff");
                             write_line(
                                 &mut out,
-                                &error_response(seq, "native_fallback", reason, "diff"),
+                                &error_response(
+                                    seq,
+                                    result.get("fallback_code").and_then(Value::as_str)
+                                        .unwrap_or("native_fallback"),
+                                    reason,
+                                    "diff",
+                                ),
                             );
                         }
                     }
@@ -467,7 +476,13 @@ fn main() {
                                 .unwrap_or("engine returned no commit diff");
                             write_line(
                                 &mut out,
-                                &error_response(seq, "native_fallback", reason, "review"),
+                                &error_response(
+                                    seq,
+                                    result.get("fallback_code").and_then(Value::as_str)
+                                        .unwrap_or("native_fallback"),
+                                    reason,
+                                    "review",
+                                ),
                             );
                         }
                     }

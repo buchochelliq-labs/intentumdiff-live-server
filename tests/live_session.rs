@@ -325,84 +325,58 @@ fn native_review_preserves_mixed_code_and_image_changes() {
     let _ = std::fs::remove_dir_all(base);
 }
 
-fn assert_incomplete_git_review(name: &str, old: &str, new: &str, offset: i64) {
+// Incomplete source may be mentioned in a diagnostic, but must never be
+// represented as a successful semantic Git review.
+fn assert_incomplete_git_review(name: &str, old: &str, new: &str) {
     let wasm_dir =
         find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
     let bin = std::env::var("INTENTUMDIFF_TEST_LIVE_SERVER")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentumdiff-live-server").to_owned());
-    {
-        let repo = unique_temp_dir();
-        git(&repo, &["init"]);
-        git(&repo, &["config", "user.email", "t@example.com"]);
-        git(&repo, &["config", "user.name", "T"]);
-        std::fs::write(repo.join(name), old).unwrap();
-        git(&repo, &["add", name]);
-        git(&repo, &["commit", "-m", "incomplete baseline"]);
-        std::fs::write(repo.join(name), new).unwrap();
-        let mut session = spawn(&bin, &repo, &wasm_dir);
-        assert_eq!(session.recv()["op"], "ready");
-        session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD", "stream": false}));
-        let response = session.recv();
-        assert_eq!(
-            response["ok"], true,
-            "{name} Git review must return source evidence: {response}"
-        );
-        let files = response["commit_diff"]["file_diffs"]
-            .as_array()
-            .expect("file diffs");
-        let diff = files
-            .iter()
-            .find(|file| file["new_filename"] == name)
-            .expect("incomplete file in review");
-        assert_eq!(diff["metadata"]["engine_owner"], "rust");
-        assert_eq!(
-            diff["metadata"]["semantic_contract"],
-            "rust_source_fallback_v1"
-        );
-        assert_eq!(diff["is_fallback"], true);
-        assert_eq!(diff["is_style_only"], false);
-        assert!(!diff["parse_errors"]
-            .as_array()
-            .expect("parse warnings")
-            .is_empty());
-        assert_eq!(diff["changes"].as_array().expect("changes").len(), 1);
-        assert_eq!(diff["changes"][0]["old_node"]["label"], "f");
-        assert_eq!(diff["changes"][0]["new_node"]["label"], "g");
-        assert_eq!(
-            diff["metadata"]["source_ranges"],
-            json!({
-                "old_start_byte": offset, "old_end_byte": offset + 1,
-                "new_start_byte": offset, "new_end_byte": offset + 1,
-            })
-        );
-        assert_eq!(diff["changes"][0]["old_node"]["position"]["start_line"], 0);
-        assert_eq!(diff["changes"][0]["new_node"]["position"]["start_line"], 0);
-        assert_eq!(
-            diff["changes"][0]["old_node"]["position"]["start_col"],
-            offset
-        );
-        assert_eq!(
-            diff["changes"][0]["new_node"]["position"]["start_col"],
-            offset
-        );
-        for side in ["old_node", "new_node"] {
-            assert_eq!(diff["changes"][0][side]["position"]["end_line"], 0);
-            assert_eq!(diff["changes"][0][side]["position"]["end_col"], offset + 1);
-        }
-        drop(session.stdin);
-        assert!(session.child.wait().unwrap().success());
-        let _ = std::fs::remove_dir_all(repo);
-    }
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join(name), old).unwrap();
+    git(&repo, &["add", name]);
+    git(&repo, &["commit", "-m", "incomplete baseline"]);
+    std::fs::write(repo.join(name), new).unwrap();
+
+    let mut session = spawn(&bin, &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD", "stream": false}));
+    let response = session.recv();
+    assert_eq!(response["op"], "review", "unexpected operation: {response}");
+    assert_eq!(response["seq"], 1, "request correlation was lost: {response}");
+    assert_eq!(
+        response["ok"], false,
+        "{name} incomplete Git review must fail closed: {response}"
+    );
+    assert_eq!(response["error"]["code"], "native_parse_incomplete");
+    let diagnostic = response["error"]["message"]
+        .as_str()
+        .expect("structured parse-incomplete diagnostic");
+    assert!(diagnostic.contains(name), "missing failed file: {response}");
+    assert!(
+        diagnostic.contains("Incomplete or invalid syntax"),
+        "missing original parser diagnostic: {response}"
+    );
+    assert!(
+        response.get("commit_diff").is_none(),
+        "incomplete review must not advertise a successful semantic diff: {response}"
+    );
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
 }
 
 #[test]
-fn native_git_review_preserves_incomplete_python_evidence() {
-    assert_incomplete_git_review("edit.py", "def f(", "def g(", 4);
+fn native_git_review_rejects_incomplete_python_evidence() {
+    assert_incomplete_git_review("edit.py", "def f(", "def g(");
 }
 
 #[test]
-fn native_git_review_preserves_incomplete_javascript_evidence() {
-    assert_incomplete_git_review("edit.js", "function f(", "function g(", 9);
+fn native_git_review_rejects_incomplete_javascript_evidence() {
+    assert_incomplete_git_review("edit.js", "function f(", "function g(");
 }
 
 fn assert_measured_parser_telemetry(
@@ -508,35 +482,37 @@ fn check_native_parser_telemetry_fixture(name: &str, language: &str, old: &str, 
     for (index, (name, language, old, new)) in fixtures.iter().enumerate() {
         session.send(&json!({"op":"diff", "seq":index + 1, "path":name, "content":new, "ref":"HEAD", "stream":false}));
         let response = session.recv();
-        assert_eq!(response["ok"], true, "{response}");
-        assert_measured_parser_telemetry(&response["diff"], name, language, old, new);
+        if *name == "broken.js" {
+            // A parse-error/fallback is never a certified direct diff.
+            // Keep the real parser fuel/telemetry checks in the review
+            // assertion below; do not restore the old fail-open ok:true.
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["error"]["code"], "native_parse_incomplete", "{response}");
+            assert!(response.get("diff").is_none(), "{response}");
+        } else {
+            assert_eq!(response["ok"], true, "{response}");
+            assert_measured_parser_telemetry(&response["diff"], name, language, old, new);
+        }
     }
     session.send(&json!({"op":"review", "seq":4, "old_ref":"HEAD", "stream":false}));
     let response = session.recv();
-    assert_eq!(response["ok"], true, "{response}");
-    let diffs = response["commit_diff"]["file_diffs"]
-        .as_array()
-        .expect("review diffs");
-    for (name, language, old, new) in fixtures {
-        let diff = diffs
-            .iter()
-            .find(|diff| diff["new_filename"] == name)
-            .expect("review fixture");
-        assert_measured_parser_telemetry(diff, name, language, old, new);
-        if name == "broken.js" {
-            assert_eq!(diff["is_fallback"], true);
-            assert!(!diff["parse_errors"]
-                .as_array()
-                .expect("parse warnings")
-                .is_empty());
-            assert!(
-                diff["metadata"]["engine_telemetry"]["calls"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|call| call["function"] == "finalize" && call["fuel_consumed"].is_null()),
-                "unmetered source-finalizer evidence must be preserved"
-            );
+    assert_eq!(response["seq"], 4, "{response}");
+    if name == "broken.js" {
+        // Core must reject the entire commit, rather than certifying a
+        // fallback parse and fabricating empty commit-level diagnostics (#193).
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["error"]["code"], "native_parse_incomplete", "{response}");
+        assert!(response["error"]["message"].as_str()
+            .is_some_and(|message| message.contains("broken.js")), "{response}");
+        assert!(response.get("commit_diff").is_none(), "{response}");
+    } else {
+        assert_eq!(response["ok"], true, "{response}");
+        let diffs = response["commit_diff"]["file_diffs"]
+            .as_array().expect("complete review diffs");
+        for (name, language, old, new) in fixtures {
+            let diff = diffs.iter().find(|diff| diff["new_filename"] == name)
+                .expect("review fixture");
+            assert_measured_parser_telemetry(diff, name, language, old, new);
         }
     }
     drop(session.stdin);
@@ -666,6 +642,51 @@ fn native_explicit_low_fuel_reports_parser_exhaustion() {
         "{response}"
     );
     assert!(response.get("diff").is_none());
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn native_diff_rejects_uncertified_parse_fallback_without_lying_about_success() {
+    // A deliberately wrong-grammar .py buffer is still correctly selected as
+    // Python by filename. A Rust diff with parse errors is not a successful
+    // semantic review, even when it contains an unparsed_source addition (#17).
+    let wasm_dir = find_wasm_dir().expect("verified parser manifest is required");
+    assert!(git_available(), "git required for source-judged stdio test");
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-live-server");
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join("README.md"), "baseline\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "baseline"]);
+
+    let mut session = spawn(bin, &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({
+        "op": "diff", "seq": 71, "path": "notebook.py", "ref": "HEAD",
+        "content": "name: etl_job\nparameters:\n  - name: env\n    default: prod\ntasks:\n  - task_key: ingest\n    notebook_task:\n      notebook_path: /notebooks/ingest\n"
+    }));
+    let failed = session.recv();
+    assert_eq!(failed["op"], "diff", "{failed}");
+    assert_eq!(failed["seq"], 71, "{failed}");
+    assert_eq!(failed["ok"], false, "parser fallback is not a certified diff: {failed}");
+    assert!(failed.get("diff").is_none(), "{failed}");
+    assert!(failed["error"]["message"].as_str().is_some_and(|s| !s.is_empty()), "{failed}");
+
+    // Control: the same pinned Rust/Python engine must still serve valid .py.
+    session.send(&json!({
+        "op": "diff", "seq": 72, "path": "example.py", "ref": "HEAD",
+        "content": "answer = 42\n"
+    }));
+    let good = session.recv();
+    assert_eq!(good["seq"], 72);
+    assert_eq!(good["ok"], true, "valid source must remain accepted: {good}");
+    assert_eq!(good["diff"]["is_fallback"], false);
+    assert_eq!(good["diff"]["parse_errors"], json!([]));
+
     drop(session.stdin);
     assert!(session.child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(repo);

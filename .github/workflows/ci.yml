@@ -39,10 +39,49 @@ jobs:
             echo "::warning::SPLIT_REPO_TOKEN not set - private cross-repo dependencies will fail to fetch"
           fi
 
+      - name: Verify parser bundle provenance guardrails
+        run: python -m unittest discover -s scripts -p test_provision_components.py
+
       - name: Provision checksum-verified parser components
         env:
           GH_TOKEN: ${{ secrets.SPLIT_REPO_TOKEN }}
         run: python scripts/provision_components.py
+
+      # RC release gate: use the audited dependency graph committed alongside
+      # this workflow. No Cargo update on the runner: --locked must exercise
+      # precisely these reviewed bytes, not a silently regenerated lock.
+      - name: Verify immutable Core/Wasmtime 48 lock and manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import tomllib
+          from scripts.provision_components import require_matching_native_core
+
+          core = "3995930d206c35758ba6525eebce49564c539fe1"
+          expected_lock_sha256 = "411411cc223b78f75e9179a4f1463c4d9bfea7f1b48e31169c7d02819256fbc7"
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())
+          actual_rev = manifest["dependencies"]["intentumdiff-rust-core"]["rev"]
+          assert actual_rev == core, f"unexpected Rust Core manifest revision: {actual_rev}"
+          require_matching_native_core(actual_rev)
+          lock_bytes = Path("Cargo.lock").read_bytes()
+          actual_hash = hashlib.sha256(lock_bytes).hexdigest()
+          assert actual_hash == expected_lock_sha256, f"native lockfile changed: {actual_hash}"
+          pkgs = tomllib.loads(lock_bytes.decode("utf-8"))["package"]
+          owned_core = [p for p in pkgs if p["name"] == "intentumdiff-rust-core"]
+          assert len(owned_core) == 1 and core in owned_core[0].get("source", ""), owned_core
+          for name in ("wasmtime", "wasmtime-wasi"):
+              versions = [p["version"] for p in pkgs if p["name"] == name]
+              assert versions == ["48.0.7"], (name, versions)
+          assert not any(
+              p["name"].startswith("wasmtime") and p["version"] == "47.0.3"
+              for p in pkgs
+          ), "legacy vulnerable Wasmtime package retained"
+          PY
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
       - name: Build + test
         run: |
