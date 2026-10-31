@@ -989,7 +989,7 @@ dependencies = [
 [[package]]
 name = "index-engine-lib"
 version = "0.1.0"
-source = "git+https://github.com/buchochelliq-labs/intentumdiff-core?rev=076c382b9fc1eae1d68bfdbc78e58187fdfd1a83#076c382b9fc1eae1d68bfdbc78e58187fdfd1a83"
+source = "git+https://github.com/buchochelliq-labs/intentumdiff-core?rev=3995930d206c35758ba6525eebce49564c539fe1#3995930d206c35758ba6525eebce49564c539fe1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1035,7 +1035,7 @@ dependencies = [
 [[package]]
 name = "intentumdiff-rust-core"
 version = "0.1.0"
-source = "git+https://github.com/buchochelliq-labs/intentumdiff-core?rev=076c382b9fc1eae1d68bfdbc78e58187fdfd1a83#076c382b9fc1eae1d68bfdbc78e58187fdfd1a83"
+source = "git+https://github.com/buchochelliq-labs/intentumdiff-core?rev=3995930d206c35758ba6525eebce49564c539fe1#3995930d206c35758ba6525eebce49564c539fe1"
 dependencies = [
  "anyhow",
  "diffy",
