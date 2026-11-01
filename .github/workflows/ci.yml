@@ -42,7 +42,7 @@ jobs:
 
       - name: Build + test
         run: |
-          cargo build --release
-          cargo test
+          cargo build --locked --release
+          cargo test --locked
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
