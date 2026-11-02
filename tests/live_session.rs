@@ -691,3 +691,56 @@ fn native_diff_rejects_uncertified_parse_fallback_without_lying_about_success() 
     assert!(session.child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(repo);
 }
+
+fn startup(repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_intentumdiff-live-server"))
+        .arg("--repo").arg(repo).args(args).stdin(Stdio::null())
+        .output().expect("native startup")
+}
+
+fn assert_config_rejected(output: std::process::Output) {
+    assert!(!output.status.success(), "configuration failure must exit nonzero");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    let response: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(response["op"], "ready", "{response}");
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(text.contains("invalid_config"), "{text}");
+}
+
+#[test]
+fn startup_never_replaces_invalid_config_with_defaults() {
+    let repo = unique_temp_dir();
+    std::fs::write(repo.join("intentumdiff.yaml"), "config: [broken").unwrap();
+    assert_config_rejected(startup(&repo, &[]));
+    std::fs::remove_file(repo.join("intentumdiff.yaml")).unwrap();
+    for args in [
+        vec!["--config-json", "{broken"],
+        vec!["--config-json", "{broken", "--fuel", "100"],
+        vec!["--config-json", "[]", "--fuel", "100"],
+        vec!["--config-json", "null", "--fuel", "100"],
+        vec!["--fuel", "garbage"],
+        vec!["--fuel"],
+        vec!["--config-json"],
+    ] {
+        assert_config_rejected(startup(&repo, &args));
+    }
+    for args in [vec![], vec!["--config-json", "{}"], vec!["--config-json", ""], vec!["--fuel", "-1"],
+                 vec!["--config-json", r#"{"max_nodes":100}"#, "--fuel", "100"]] {
+        let output = startup(&repo, &args);
+        assert!(output.status.success());
+        let ready: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(ready["ok"], true, "{ready}");
+    }
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_rejects_dangling_project_config() {
+    let repo = unique_temp_dir();
+    std::os::unix::fs::symlink("missing.yaml", repo.join("intentumdiff.yaml")).unwrap();
+    assert_config_rejected(startup(&repo, &[]));
+    std::fs::remove_dir_all(repo).unwrap();
+}
