@@ -744,3 +744,111 @@ fn startup_rejects_dangling_project_config() {
     assert_config_rejected(startup(&repo, &[]));
     std::fs::remove_dir_all(repo).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 0.0.2 independent review (#24, Core #229): judge the native `diff` op against the
+// expected result, not against the Python runtime (both share one Core).
+// ---------------------------------------------------------------------------
+
+fn native_live_diff(path: &str, old: &str, new: &str) -> Value {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    assert!(git_available(), "git is required for protocol verification");
+    let base = unique_temp_dir();
+    git(&base, &["init"]);
+    git(&base, &["config", "user.email", "t@example.com"]);
+    git(&base, &["config", "user.name", "T"]);
+    std::fs::write(base.join(path), old).unwrap();
+    git(&base, &["add", "."]);
+    git(&base, &["commit", "-m", "base"]);
+    let mut session = spawn(env!("CARGO_BIN_EXE_intentumdiff-live-server"), &base, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "diff", "seq": 1, "path": path, "content": new, "ref": "HEAD"}));
+    let response = session.recv();
+    drop(session.stdin);
+    let _ = session.child.wait();
+    let _ = std::fs::remove_dir_all(base);
+    response
+}
+
+fn assert_semantic_operator_change(path: &str, old: &str, new: &str) {
+    let r = native_live_diff(path, old, new);
+    assert_eq!(r["ok"], true, "{path}: operator change must be served, got: {r}");
+    assert_eq!(r["diff"]["is_style_only"], false, "{path}: operator change reported style-only: {r}");
+    assert_eq!(r["diff"]["has_semantic_changes"], true, "{path}: {r}");
+    assert!(
+        !r["diff"]["changes"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "{path}: operator change produced no changes: {r}"
+    );
+}
+
+#[test]
+fn native_python_operator_change_is_semantic() {
+    assert_semantic_operator_change(
+        "a.py",
+        "def f(a, b):\n    return a + b\n",
+        "def f(a, b):\n    return a - b\n",
+    );
+}
+
+#[test]
+fn native_javascript_operator_change_is_semantic() {
+    assert_semantic_operator_change(
+        "a.js",
+        "function f(a, b) {\n  return a + b;\n}\n",
+        "function f(a, b) {\n  return a - b;\n}\n",
+    );
+}
+
+#[test]
+fn native_go_operator_change_is_semantic() {
+    assert_semantic_operator_change(
+        "a.go",
+        "package m\n\nfunc F(a, b int) int {\n\treturn a + b\n}\n",
+        "package m\n\nfunc F(a, b int) int {\n\treturn a - b\n}\n",
+    );
+}
+
+#[test]
+fn native_python_comment_only_edit_is_served_as_style_only() {
+    // #24: this returned `native_fallback` ("style-only changed file is not certified"),
+    // so every formatting/comment edit in a Python file errored in the default runtime.
+    let r = native_live_diff(
+        "a.py",
+        "def f(a, b):\n    return a + b\n",
+        "def f(a, b):\n    # sum\n    return a + b\n",
+    );
+    assert_eq!(r["ok"], true, "comment-only Python edit must be served: {r}");
+    assert_eq!(r["diff"]["is_style_only"], true, "{r}");
+    assert_eq!(r["diff"]["has_semantic_changes"], false, "{r}");
+}
+
+#[test]
+fn native_rejects_unknown_config_json_keys() {
+    // #26: a misspelled option must not silently fall back to defaults.
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let base = unique_temp_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_intentumdiff-live-server"))
+        .args([
+            "live-server",
+            &base.to_string_lossy(),
+            "--stdio",
+            "--ref",
+            "HEAD",
+            "--wasm-dir",
+            &wasm_dir.to_string_lossy(),
+            "--config-json",
+            r#"{"ignore_styel": true}"#,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(r#""op":"ready","ok":true"#),
+        "unknown config key accepted at startup: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(2), "expected invalid_config exit 2: {stdout}");
+    let _ = std::fs::remove_dir_all(base);
+}
