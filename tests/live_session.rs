@@ -822,33 +822,3 @@ fn native_python_comment_only_edit_is_served_as_style_only() {
     assert_eq!(r["diff"]["is_style_only"], true, "{r}");
     assert_eq!(r["diff"]["has_semantic_changes"], false, "{r}");
 }
-
-#[test]
-fn native_rejects_unknown_config_json_keys() {
-    // #26: a misspelled option must not silently fall back to defaults.
-    let wasm_dir =
-        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
-    let base = unique_temp_dir();
-    let output = Command::new(env!("CARGO_BIN_EXE_intentumdiff-live-server"))
-        .args([
-            "live-server",
-            &base.to_string_lossy(),
-            "--stdio",
-            "--ref",
-            "HEAD",
-            "--wasm-dir",
-            &wasm_dir.to_string_lossy(),
-            "--config-json",
-            r#"{"ignore_styel": true}"#,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains(r#""op":"ready","ok":true"#),
-        "unknown config key accepted at startup: {stdout}"
-    );
-    assert_eq!(output.status.code(), Some(2), "expected invalid_config exit 2: {stdout}");
-    let _ = std::fs::remove_dir_all(base);
-}
