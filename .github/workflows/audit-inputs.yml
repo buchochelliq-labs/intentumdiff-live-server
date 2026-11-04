@@ -1,0 +1,92 @@
+name: Reproducible installed-wheel audit inputs
+
+on:
+  pull_request:
+    branches: ["release/v0.0.2-rc"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-inputs:
+    name: Collect exact source and offline Python audit dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHON_SOURCE_COMMIT: "971c4fe9441e7789d58ff703cc1ad40072ccfa85"
+      PYPROJECT_BLOB: "3d6dea41738fb3bf8e2a713faba1598f85d40c29"
+    steps:
+      - name: Checkout native candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Checkout exact Python candidate for source comparison only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: buchochelliq-labs/intentumdiff-python
+          ref: ${{ env.PYTHON_SOURCE_COMMIT }}
+          path: audit-python-source
+          persist-credentials: false
+      - name: Install audit host Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Attest source and collect declared audit dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-inputs/wheelhouse
+          test "$(git -C audit-python-source rev-parse HEAD)" = "$PYTHON_SOURCE_COMMIT"
+          git rev-parse HEAD > audit-inputs/native-source-commit.txt
+          git -C audit-python-source rev-parse HEAD > audit-inputs/python-source-commit.txt
+          git archive --format=tar HEAD | gzip -n > audit-inputs/native-source.tar.gz
+          git -C audit-python-source archive --format=tar HEAD | gzip -n > audit-inputs/python-source.tar.gz
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import tomllib
+
+          raw = Path("audit-python-source/pyproject.toml").read_bytes()
+          blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+          if blob != os.environ["PYPROJECT_BLOB"]:
+              raise SystemExit("Python dependency manifest differs from reviewed source")
+          project = tomllib.loads(raw.decode("utf-8"))["project"]
+          requirements = list(project["dependencies"])
+          for extra in ("lsp", "lsp-server", "serve"):
+              requirements.extend(project["optional-dependencies"][extra])
+          requirements.extend(("pytest>=8.0", "pytest-timeout>=2.3", "httpx>=0.27"))
+          requirements = sorted(set(requirements))
+          if "wasmtime==50.0.1" not in requirements:
+              raise SystemExit("Declared Wasmtime pin is missing")
+          out = Path("audit-inputs")
+          (out / "requirements.in").write_text("\n".join(requirements) + "\n", encoding="utf-8")
+          (out / "environment.json").write_text(json.dumps({
+              "python": platform.python_version(),
+              "platform": platform.platform(),
+              "python_source_commit": os.environ["PYTHON_SOURCE_COMMIT"],
+              "pyproject_git_blob": blob,
+              "purpose": "Offline inputs, not runtime certification or a replacement product wheel",
+          }, indent=2) + "\n", encoding="utf-8")
+          PY
+          # No editable/source installation and no substituted Wasmtime version.
+          # The independently verified product wheel is installed separately by auditors.
+          python -m pip --isolated download --only-binary=:all: --dest audit-inputs/wheelhouse -r audit-inputs/requirements.in
+          python -m pip --version > audit-inputs/pip-version.txt
+      - name: Hash every retained input
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd audit-inputs
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Upload offline audit inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-inputs-python313-${{ github.sha }}
+          path: audit-inputs/
+          if-no-files-found: error
+          retention-days: 14

@@ -8,16 +8,18 @@ The **native IntentumDiff live-server** — the keystroke-level diff/review IPC 
 editor integrations spawn. An in-process consumer of the engine
 ([intentumdiff-core](https://github.com/buchochelliq-labs/intentumdiff-core)): it links the
 core natively ("a binding that speaks sockets instead of function calls") and wraps it
-with the transport (unix socket / Windows named pipe, accept loops, debounce, shutdown).
+with the stdio JSON-line transport and clean EOF shutdown.
 
 ## Build
 
 ```bash
-cargo build --release    # -> target/release/intentumdiff-live-server
-cargo test
+GH_TOKEN=... python scripts/provision_components.py
+export INTENTUMDIFF_TEST_WASM_DIR="$PWD/dist/wasm"
+cargo build --locked --release
+cargo test --locked
 ```
 
-Toolchain: Rust 1.93.0 (pinned in CI).
+Toolchain: Rust 1.95.0 (pinned in CI). See [building and verified CI artifacts](docs/BUILDING.md).
 
 ## Provenance
 

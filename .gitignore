@@ -7,3 +7,7 @@ vendor/
 Thumbs.db
 .idea/
 .vscode/
+
+/dist/
+/artifacts/
+__pycache__/

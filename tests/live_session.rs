@@ -1,8 +1,8 @@
 //! End-to-end regression test for the native live-server (#100): spawn the built binary and
 //! drive a full JSON-line protocol-v2 session over stdio, asserting the wire contract the VS
 //! Code extension depends on — `ready`, `hello`, `diff`, `review`, `cancel`, clean EOF exit.
-//! Self-contained (shells out to `git`, no Python); skips (passes with a note) when the
-//! bundled wasm parsers or `git` are unavailable.
+//! Self-contained (shells out to `git`, no Python); fails closed when verified
+//! bundled Wasm parsers or `git` are unavailable.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,14 @@ use serde_json::{json, Value};
 
 /// The dev-layout wasm dir (walk ancestors for `src/intentumdiff/wasm`), manifest-verified.
 fn find_wasm_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("INTENTUMDIFF_TEST_WASM_DIR") {
+        let path = PathBuf::from(dir);
+        assert!(
+            path.join("parser_manifest.json").is_file(),
+            "test parser manifest missing"
+        );
+        return Some(path);
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for ancestor in manifest.ancestors() {
         let dev = ancestor.join("src").join("intentumdiff").join("wasm");
@@ -50,8 +58,10 @@ fn unique_temp_dir() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("intentumdiff-live-it-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "intentumdiff-live-it-{}-{nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -77,6 +87,10 @@ impl Session {
 }
 
 fn spawn(bin: &str, repo: &Path, wasm_dir: &Path) -> Session {
+    spawn_with_extra_args(bin, repo, wasm_dir, &[])
+}
+
+fn spawn_with_extra_args(bin: &str, repo: &Path, wasm_dir: &Path, extra_args: &[&str]) -> Session {
     // Exercise the extension-shaped argv (`live-server <root> --stdio --ref R ...`).
     let mut child = Command::new(bin)
         .args([
@@ -88,6 +102,7 @@ fn spawn(bin: &str, repo: &Path, wasm_dir: &Path) -> Session {
             "--wasm-dir",
             &wasm_dir.to_string_lossy(),
         ])
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -117,14 +132,9 @@ fn spawn(bin: &str, repo: &Path, wasm_dir: &Path) -> Session {
 
 #[test]
 fn native_live_server_serves_the_protocol() {
-    let Some(wasm_dir) = find_wasm_dir() else {
-        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
-        return;
-    };
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return;
-    }
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    assert!(git_available(), "git is required for protocol verification");
     let bin = env!("CARGO_BIN_EXE_intentumdiff-live-server");
 
     let base = unique_temp_dir();
@@ -148,11 +158,18 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(ready["protocol_version"], 2);
     assert_eq!(ready["transport"], "stdio");
     assert_eq!(ready["ref"], "HEAD");
-    assert!(ready["wasm_dir"].is_string(), "wasm_dir should be resolved: {ready}");
+    assert!(
+        ready["wasm_dir"].is_string(),
+        "wasm_dir should be resolved: {ready}"
+    );
     assert!(
         ready["capabilities"]["review"].as_bool().unwrap_or(false),
         "review capability should be advertised: {ready}"
     );
+
+    assert_eq!(ready["capabilities"]["stream"], false);
+    assert_eq!(ready["capabilities"]["review_streaming"], false);
+    assert_eq!(ready["capabilities"]["edit_deltas"], false);
 
     // 2. hello echoes the protocol handshake.
     s.send(&json!({"op": "hello", "seq": 1}));
@@ -178,7 +195,10 @@ fn native_live_server_serves_the_protocol() {
         .iter()
         .filter_map(|c| c["change_type"].as_str())
         .collect();
-    assert!(change_types.contains(&"MODIFICATION"), "got {change_types:?}");
+    assert!(
+        change_types.contains(&"MODIFICATION"),
+        "got {change_types:?}"
+    );
 
     // 4. A working-tree review (old_ref HEAD, no new_ref = the extension's default).
     s.send(&json!({"op": "review", "seq": 3, "old_ref": "HEAD"}));
@@ -200,10 +220,605 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(cancel["op"], "cancel");
     assert_eq!(cancel["ok"], true);
 
+    std::fs::write(repo.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
+    git(&repo, &["add", "card.png"]);
+    git(&repo, &["commit", "-m", "image base"]);
+    std::fs::write(repo.join("card.png"), include_bytes!("fixtures/after.png")).unwrap();
+    s.send(&json!({"op": "asset_diff", "seq": 5, "path": "card.png"}));
+    let asset = s.recv();
+    assert_eq!(
+        asset["op"], "asset_diff",
+        "asset operation must be dispatched: {asset}"
+    );
+    assert_eq!(asset["ok"], true, "{asset}");
+    assert_eq!(asset["result"]["status"], "compared");
+    for layer in [
+        "before",
+        "after",
+        "diff",
+        "heatmap",
+        "mask",
+        "overlay",
+        "contact_sheet",
+    ] {
+        let path = Path::new(
+            asset["result"]["artifacts"][layer]
+                .as_str()
+                .expect("artifact path"),
+        );
+        assert!(path.is_file(), "missing artifact {layer}");
+        assert!(
+            path.starts_with(repo.join(".intentumdiff-cache")),
+            "artifact escaped cache"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(repo.join(".intentumdiff-cache/.gitignore"))
+            .unwrap()
+            .contains('*')
+    );
+    s.send(&json!({"op": "asset_diff", "seq": 6, "path": "../outside.png"}));
+    let asset = s.recv();
+    assert_eq!(
+        asset["op"], "asset_diff",
+        "asset operation must be dispatched: {asset}"
+    );
+    assert_eq!(asset["ok"], false);
+    assert_eq!(asset["error"]["code"], "invalid_request");
+
     // 6. Clean shutdown on stdin EOF (#73).
     drop(s.stdin);
     let status = s.child.wait().expect("wait");
     assert!(status.success(), "clean exit expected, got {status:?}");
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn native_review_preserves_mixed_code_and_image_changes() {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    assert!(git_available(), "git is required for protocol verification");
+    let base = unique_temp_dir();
+    git(&base, &["init"]);
+    git(&base, &["config", "user.email", "t@example.com"]);
+    git(&base, &["config", "user.name", "T"]);
+    std::fs::write(base.join("a.ts"), "const x: number = 1;\n").unwrap();
+    std::fs::write(base.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
+    git(&base, &["add", "."]);
+    git(&base, &["commit", "-m", "mixed base"]);
+    std::fs::write(base.join("a.ts"), "const x: number = 2;\n").unwrap();
+    std::fs::write(base.join("card.png"), include_bytes!("fixtures/after.png")).unwrap();
+    let mut session = spawn(
+        env!("CARGO_BIN_EXE_intentumdiff-live-server"),
+        &base,
+        &wasm_dir,
+    );
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD"}));
+    let response = session.recv();
+    assert_eq!(
+        response["ok"], true,
+        "mixed review must preserve code and assets: {response}"
+    );
+    let files = response["commit_diff"]["file_diffs"]
+        .as_array()
+        .expect("file diffs");
+    assert!(
+        files.iter().any(|file| file["new_filename"] == "a.ts"),
+        "missing code: {response}"
+    );
+    // Both Python and native text review skip binary bytes. VS Code requests the
+    // image separately from its Git snapshot; exercise that same wire contract.
+    session.send(&json!({"op": "asset_diff", "seq": 2, "path": "card.png", "ref": "HEAD"}));
+    let image = session.recv();
+    assert_eq!(image["ok"], true, "mixed image review failed: {image}");
+    assert_eq!(image["result"]["status"], "compared");
+    assert!(
+        image["result"]["changed_pixel_percentage"]
+            .as_f64()
+            .unwrap_or_default()
+            > 0.0
+    );
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// Incomplete source may be mentioned in a diagnostic, but must never be
+// represented as a successful semantic Git review.
+fn assert_incomplete_git_review(name: &str, old: &str, new: &str) {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let bin = std::env::var("INTENTUMDIFF_TEST_LIVE_SERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentumdiff-live-server").to_owned());
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join(name), old).unwrap();
+    git(&repo, &["add", name]);
+    git(&repo, &["commit", "-m", "incomplete baseline"]);
+    std::fs::write(repo.join(name), new).unwrap();
+
+    let mut session = spawn(&bin, &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD", "stream": false}));
+    let response = session.recv();
+    assert_eq!(response["op"], "review", "unexpected operation: {response}");
+    assert_eq!(response["seq"], 1, "request correlation was lost: {response}");
+    assert_eq!(
+        response["ok"], false,
+        "{name} incomplete Git review must fail closed: {response}"
+    );
+    assert_eq!(response["error"]["code"], "native_parse_incomplete");
+    let diagnostic = response["error"]["message"]
+        .as_str()
+        .expect("structured parse-incomplete diagnostic");
+    assert!(diagnostic.contains(name), "missing failed file: {response}");
+    assert!(
+        diagnostic.contains("Incomplete or invalid syntax"),
+        "missing original parser diagnostic: {response}"
+    );
+    assert!(
+        response.get("commit_diff").is_none(),
+        "incomplete review must not advertise a successful semantic diff: {response}"
+    );
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn native_git_review_rejects_incomplete_python_evidence() {
+    assert_incomplete_git_review("edit.py", "def f(", "def g(");
+}
+
+#[test]
+fn native_git_review_rejects_incomplete_javascript_evidence() {
+    assert_incomplete_git_review("edit.js", "function f(", "function g(");
+}
+
+fn assert_measured_parser_telemetry(
+    diff: &Value,
+    path: &str,
+    language: &str,
+    old: &str,
+    new: &str,
+) {
+    let telemetry = &diff["metadata"]["engine_telemetry"];
+    assert_eq!(
+        telemetry["schema_version"], 1,
+        "missing measured telemetry for {path}: {diff}"
+    );
+    let calls = telemetry["calls"]
+        .as_array()
+        .expect("engine telemetry calls");
+    let processes: Vec<_> = calls
+        .iter()
+        .filter(|call| call["function"] == "process")
+        .collect();
+    assert!(
+        !processes.is_empty(),
+        "missing actual parser process measurements: {diff}"
+    );
+    let mut measured_sum = 0u64;
+    let mut declared_total = 0u64;
+    let mut peak = 0u64;
+    for call in &processes {
+        assert_eq!(call["engine_owner"], "rust");
+        assert_eq!(call["engine"], "rust_wasmtime_plugin_host");
+        assert_eq!(call["filename"], path);
+        assert_eq!(call["language"], language);
+        assert!(Path::new(call["plugin"].as_str().expect("actual parser path")).is_file());
+        assert_eq!(call["call_count"], 1);
+        assert_eq!(call["statuses"]["ok"], 1);
+        let budget = call["fuel_budget"]
+            .as_u64()
+            .expect("actual metered fuel budget");
+        let consumed = call["fuel_consumed"]
+            .as_u64()
+            .expect("actual consumed fuel");
+        assert!(
+            budget > 0 && consumed > 0 && consumed <= budget,
+            "invalid fuel measurements: {call}"
+        );
+        let elapsed = call["elapsed_ms"].as_f64().expect("actual elapsed time");
+        assert!(
+            elapsed.is_finite() && elapsed >= 0.0,
+            "invalid elapsed time: {call}"
+        );
+        let percent = call["max_fuel_used_percent"]
+            .as_f64()
+            .expect("measured fuel percentage");
+        assert!((percent - consumed as f64 / budget as f64 * 100.0).abs() < 0.001);
+        let bytes = call["input_bytes"].as_u64().expect("actual input bytes") as usize;
+        assert!(
+            bytes == old.len() || bytes == new.len(),
+            "wrong parser input size: {call}"
+        );
+        assert_eq!(call["input_lines"], 1);
+        measured_sum += consumed;
+        declared_total += call["total_fuel_consumed"]
+            .as_u64()
+            .expect("actual total fuel");
+        peak = peak.max(consumed);
+    }
+    for input in [old, new] {
+        assert!(
+            processes
+                .iter()
+                .any(|call| call["input_bytes"].as_u64() == Some(input.len() as u64)),
+            "missing measurement for one source side: {diff}"
+        );
+    }
+    assert_eq!(
+        declared_total, measured_sum,
+        "per-process total must match measured fuel"
+    );
+    assert!(declared_total >= peak && peak > 0);
+}
+
+fn check_native_parser_telemetry_fixture(name: &str, language: &str, old: &str, new: &str) {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let bin = std::env::var("INTENTUMDIFF_TEST_LIVE_SERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentumdiff-live-server").to_owned());
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    let fixtures = [(name, language, old, new)];
+    for (name, _, old, _) in fixtures {
+        std::fs::write(repo.join(name), old).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "telemetry baseline"]);
+    for (name, _, _, new) in fixtures {
+        std::fs::write(repo.join(name), new).unwrap();
+    }
+    let mut session = spawn(&bin, &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    for (index, (name, language, old, new)) in fixtures.iter().enumerate() {
+        session.send(&json!({"op":"diff", "seq":index + 1, "path":name, "content":new, "ref":"HEAD", "stream":false}));
+        let response = session.recv();
+        if *name == "broken.js" {
+            // A parse-error/fallback is never a certified direct diff.
+            // Keep the real parser fuel/telemetry checks in the review
+            // assertion below; do not restore the old fail-open ok:true.
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["error"]["code"], "native_parse_incomplete", "{response}");
+            assert!(response.get("diff").is_none(), "{response}");
+        } else {
+            assert_eq!(response["ok"], true, "{response}");
+            assert_measured_parser_telemetry(&response["diff"], name, language, old, new);
+        }
+    }
+    session.send(&json!({"op":"review", "seq":4, "old_ref":"HEAD", "stream":false}));
+    let response = session.recv();
+    assert_eq!(response["seq"], 4, "{response}");
+    if name == "broken.js" {
+        // Core must reject the entire commit, rather than certifying a
+        // fallback parse and fabricating empty commit-level diagnostics (#193).
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["error"]["code"], "native_parse_incomplete", "{response}");
+        assert!(response["error"]["message"].as_str()
+            .is_some_and(|message| message.contains("broken.js")), "{response}");
+        assert!(response.get("commit_diff").is_none(), "{response}");
+    } else {
+        assert_eq!(response["ok"], true, "{response}");
+        let diffs = response["commit_diff"]["file_diffs"]
+            .as_array().expect("complete review diffs");
+        for (name, language, old, new) in fixtures {
+            let diff = diffs.iter().find(|diff| diff["new_filename"] == name)
+                .expect("review fixture");
+            assert_measured_parser_telemetry(diff, name, language, old, new);
+        }
+    }
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn native_parser_telemetry_for_javascript() {
+    check_native_parser_telemetry_fixture(
+        "edit.js",
+        "javascript",
+        "function f(){return 1;}\n",
+        "function f(){return 22;}\n",
+    );
+}
+
+#[test]
+fn native_parser_telemetry_for_json() {
+    check_native_parser_telemetry_fixture(
+        "settings.json",
+        "json",
+        "{\"count\":1}\n",
+        "{\"count\":222}\n",
+    );
+}
+
+#[test]
+fn native_parser_telemetry_for_source_fallback() {
+    check_native_parser_telemetry_fixture(
+        "broken.js",
+        "javascript",
+        "function f(",
+        "function longer(",
+    );
+}
+
+#[test]
+fn native_unlimited_live_diff_keeps_capped_measured_git_review() {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let bin = std::env::var("INTENTUMDIFF_TEST_LIVE_SERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentumdiff-live-server").to_owned());
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    let old = "{\"count\":1}\n";
+    let new = "{\"count\":22}\n";
+    std::fs::write(repo.join("settings.json"), old).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "unlimited live baseline"]);
+    std::fs::write(repo.join("settings.json"), new).unwrap();
+    let mut session = spawn_with_extra_args(&bin, &repo, &wasm_dir, &["--fuel", "-1"]);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op":"review", "seq":1, "old_ref":"HEAD", "stream":false}));
+    let review = session.recv();
+    assert_eq!(review["ok"], true, "{review}");
+    assert_eq!(
+        review["metadata"]["review_fuel_capped"], true,
+        "core review policy metadata was lost: {review}"
+    );
+    assert_eq!(review["metadata"]["review_plugin_fuel"], 100_000_000);
+    let diff = &review["commit_diff"]["file_diffs"][0];
+    assert_measured_parser_telemetry(diff, "settings.json", "json", old, new);
+    for call in diff["metadata"]["engine_telemetry"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|call| call["function"] == "process")
+    {
+        assert_eq!(call["fuel_budget"], 100_000_000);
+    }
+    session.send(&json!({"op":"diff", "seq":2, "path":"settings.json", "content":new, "ref":"HEAD", "stream":false}));
+    let direct = session.recv();
+    assert_eq!(direct["ok"], true, "{direct}");
+    let processes: Vec<_> = direct["diff"]["metadata"]["engine_telemetry"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|call| call["function"] == "process")
+        .collect();
+    assert!(
+        !processes.is_empty(),
+        "unlimited calls still need honest telemetry"
+    );
+    for call in processes {
+        assert!(call["fuel_budget"].is_null());
+        assert!(call["fuel_consumed"].is_null());
+        assert!(call["total_fuel_consumed"].is_null());
+        assert!(call["max_fuel_used_percent"].is_null());
+        assert!(call["elapsed_ms"].as_f64().unwrap() >= 0.0);
+    }
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn native_explicit_low_fuel_reports_parser_exhaustion() {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let bin = std::env::var("INTENTUMDIFF_TEST_LIVE_SERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentumdiff-live-server").to_owned());
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join("edit.js"), "function f(){return 1;}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "low fuel baseline"]);
+    let mut session = spawn_with_extra_args(&bin, &repo, &wasm_dir, &["--fuel", "100"]);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op":"diff", "seq":1, "path":"edit.js",
+        "content":"function f(){return 22;}\n", "ref":"HEAD", "stream":false}));
+    let response = session.recv();
+    assert_eq!(
+        response["ok"], false,
+        "explicit fuel limit must not be silently promoted: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("structured error")
+            .to_lowercase()
+            .contains("fuel"),
+        "{response}"
+    );
+    assert!(response.get("diff").is_none());
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn native_diff_rejects_uncertified_parse_fallback_without_lying_about_success() {
+    // A deliberately wrong-grammar .py buffer is still correctly selected as
+    // Python by filename. A Rust diff with parse errors is not a successful
+    // semantic review, even when it contains an unparsed_source addition (#17).
+    let wasm_dir = find_wasm_dir().expect("verified parser manifest is required");
+    assert!(git_available(), "git required for source-judged stdio test");
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-live-server");
+    let repo = unique_temp_dir();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join("README.md"), "baseline\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "baseline"]);
+
+    let mut session = spawn(bin, &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({
+        "op": "diff", "seq": 71, "path": "notebook.py", "ref": "HEAD",
+        "content": "name: etl_job\nparameters:\n  - name: env\n    default: prod\ntasks:\n  - task_key: ingest\n    notebook_task:\n      notebook_path: /notebooks/ingest\n"
+    }));
+    let failed = session.recv();
+    assert_eq!(failed["op"], "diff", "{failed}");
+    assert_eq!(failed["seq"], 71, "{failed}");
+    assert_eq!(failed["ok"], false, "parser fallback is not a certified diff: {failed}");
+    assert!(failed.get("diff").is_none(), "{failed}");
+    assert!(failed["error"]["message"].as_str().is_some_and(|s| !s.is_empty()), "{failed}");
+
+    // Control: the same pinned Rust/Python engine must still serve valid .py.
+    session.send(&json!({
+        "op": "diff", "seq": 72, "path": "example.py", "ref": "HEAD",
+        "content": "answer = 42\n"
+    }));
+    let good = session.recv();
+    assert_eq!(good["seq"], 72);
+    assert_eq!(good["ok"], true, "valid source must remain accepted: {good}");
+    assert_eq!(good["diff"]["is_fallback"], false);
+    assert_eq!(good["diff"]["parse_errors"], json!([]));
+
+    drop(session.stdin);
+    assert!(session.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+fn startup(repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_intentumdiff-live-server"))
+        .arg("--repo").arg(repo).args(args).stdin(Stdio::null())
+        .output().expect("native startup")
+}
+
+fn assert_config_rejected(output: std::process::Output) {
+    assert!(!output.status.success(), "configuration failure must exit nonzero");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    let response: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(response["op"], "ready", "{response}");
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(text.contains("invalid_config"), "{text}");
+}
+
+#[test]
+fn startup_never_replaces_invalid_config_with_defaults() {
+    let repo = unique_temp_dir();
+    std::fs::write(repo.join("intentumdiff.yaml"), "config: [broken").unwrap();
+    assert_config_rejected(startup(&repo, &[]));
+    std::fs::remove_file(repo.join("intentumdiff.yaml")).unwrap();
+    for args in [
+        vec!["--config-json", "{broken"],
+        vec!["--config-json", "{broken", "--fuel", "100"],
+        vec!["--config-json", "[]", "--fuel", "100"],
+        vec!["--config-json", "null", "--fuel", "100"],
+        vec!["--fuel", "garbage"],
+        vec!["--fuel"],
+        vec!["--config-json"],
+    ] {
+        assert_config_rejected(startup(&repo, &args));
+    }
+    for args in [vec![], vec!["--config-json", "{}"], vec!["--config-json", ""], vec!["--fuel", "-1"],
+                 vec!["--config-json", r#"{"max_nodes":100}"#, "--fuel", "100"]] {
+        let output = startup(&repo, &args);
+        assert!(output.status.success());
+        let ready: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(ready["ok"], true, "{ready}");
+    }
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_rejects_dangling_project_config() {
+    let repo = unique_temp_dir();
+    std::os::unix::fs::symlink("missing.yaml", repo.join("intentumdiff.yaml")).unwrap();
+    assert_config_rejected(startup(&repo, &[]));
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 0.0.2 independent review (#24, Core #229): judge the native `diff` op against the
+// expected result, not against the Python runtime (both share one Core).
+// ---------------------------------------------------------------------------
+
+fn native_live_diff(path: &str, old: &str, new: &str) -> Value {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    assert!(git_available(), "git is required for protocol verification");
+    let base = unique_temp_dir();
+    git(&base, &["init"]);
+    git(&base, &["config", "user.email", "t@example.com"]);
+    git(&base, &["config", "user.name", "T"]);
+    std::fs::write(base.join(path), old).unwrap();
+    git(&base, &["add", "."]);
+    git(&base, &["commit", "-m", "base"]);
+    let mut session = spawn(env!("CARGO_BIN_EXE_intentumdiff-live-server"), &base, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "diff", "seq": 1, "path": path, "content": new, "ref": "HEAD"}));
+    let response = session.recv();
+    drop(session.stdin);
+    let _ = session.child.wait();
+    let _ = std::fs::remove_dir_all(base);
+    response
+}
+
+fn assert_semantic_operator_change(path: &str, old: &str, new: &str) {
+    let r = native_live_diff(path, old, new);
+    assert_eq!(r["ok"], true, "{path}: operator change must be served, got: {r}");
+    assert_eq!(r["diff"]["is_style_only"], false, "{path}: operator change reported style-only: {r}");
+    assert_eq!(r["diff"]["has_semantic_changes"], true, "{path}: {r}");
+    assert!(
+        !r["diff"]["changes"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "{path}: operator change produced no changes: {r}"
+    );
+}
+
+#[test]
+fn native_python_operator_change_is_semantic() {
+    assert_semantic_operator_change(
+        "a.py",
+        "def f(a, b):\n    return a + b\n",
+        "def f(a, b):\n    return a - b\n",
+    );
+}
+
+#[test]
+fn native_javascript_operator_change_is_semantic() {
+    assert_semantic_operator_change(
+        "a.js",
+        "function f(a, b) {\n  return a + b;\n}\n",
+        "function f(a, b) {\n  return a - b;\n}\n",
+    );
+}
+
+#[test]
+fn native_go_operator_change_is_semantic() {
+    assert_semantic_operator_change(
+        "a.go",
+        "package m\n\nfunc F(a, b int) int {\n\treturn a + b\n}\n",
+        "package m\n\nfunc F(a, b int) int {\n\treturn a - b\n}\n",
+    );
+}
+
+#[test]
+fn native_python_comment_only_edit_is_served_as_style_only() {
+    // #24: this returned `native_fallback` ("style-only changed file is not certified"),
+    // so every formatting/comment edit in a Python file errored in the default runtime.
+    let r = native_live_diff(
+        "a.py",
+        "def f(a, b):\n    return a + b\n",
+        "def f(a, b):\n    # sum\n    return a + b\n",
+    );
+    assert_eq!(r["ok"], true, "comment-only Python edit must be served: {r}");
+    assert_eq!(r["diff"]["is_style_only"], true, "{r}");
+    assert_eq!(r["diff"]["has_semantic_changes"], false, "{r}");
 }

@@ -120,47 +120,61 @@ fn error_response(seq: i64, code: &str, message: &str, op: &str) -> Value {
         .unwrap_or_else(|| json!({ "op": op, "seq": seq, "ok": false }))
 }
 
+
+fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str), String> {
+    let option = |flag: &str| -> Result<Option<String>, String> {
+        match args.iter().position(|arg| arg == flag) {
+            Some(index) => args.get(index + 1).cloned().map(Some)
+                .ok_or_else(|| format!("{flag} requires a value")),
+            None => Ok(None),
+        }
+    };
+    let (raw, source) = match option("--config-json")? {
+        Some(explicit) => (explicit, "flag"),
+        None => {
+            let loaded = proto::live_load_project_config_impl(repo)?;
+            let source = if loaded.trim() == "{}" { "defaults" } else { "intentumdiff.yaml" };
+            (loaded, source)
+        }
+    };
+    // This shell only decodes the transport object to apply the CLI override.
+    // Interpretation and validation of engine options remain in Rust Core.
+    let mut config: Value = if raw.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&raw)
+            .map_err(|error| format!("invalid config JSON: {error}"))?
+    };
+    let fields = config.as_object_mut().ok_or("config must be a JSON object")?;
+    if let Some(raw_fuel) = option("--fuel")? {
+        let fuel = raw_fuel.parse::<i64>()
+            .map_err(|_| "--fuel must be a signed integer".to_owned())?;
+        fields.insert("plugin_fuel".to_owned(), json!(fuel));
+    }
+    Ok((config.to_string(), source))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let repo = repo_from_args(&args).unwrap_or_else(|| ".".to_owned());
     let default_ref = arg_value(&args, "--ref").unwrap_or_else(|| "HEAD".to_owned());
     let wasm_dir = resolve_wasm_dir(&args);
-    // Engine config, matching the Python server's `_load_cli_config(config_start_path=repo)`
-    // exactly: an explicit --config-json wins; otherwise the repo's intentumdiff.yaml `config:`
-    // section loads natively (#99 loader), with the extension CLI's --fuel overriding plugin_fuel
-    // on top. A malformed config file degrades to defaults WITH a ready-line warning (the Python
-    // CLI exits instead; a keystroke server staying alive with a loud warning is kinder).
-    // (--stdio is a no-op — this transport IS stdio; --debounce is accepted and ignored, the
-    // extension debounces client-side.)
-    let mut config_warnings: Vec<String> = Vec::new();
-    let (config_json, config_source) = match arg_value(&args, "--config-json") {
-        Some(explicit) => (explicit, "flag"),
-        None => match proto::live_load_project_config_impl(&repo) {
-            Ok(loaded) if loaded.trim() != "{}" => (loaded, "intentumdiff.yaml"),
-            Ok(_) => ("{}".to_owned(), "defaults"),
-            Err(e) => {
-                config_warnings.push(format!(
-                    "intentumdiff.yaml config not loaded ({e}); using engine defaults"
-                ));
-                ("{}".to_owned(), "defaults")
-            }
-        },
-    };
-    let config_json = match arg_value(&args, "--fuel").and_then(|f| f.parse::<i64>().ok()) {
-        Some(fuel) => {
-            let mut value: Value = serde_json::from_str(&config_json).unwrap_or_else(|_| json!({}));
-            value["plugin_fuel"] = json!(fuel);
-            value.to_string()
+    let (config_json, config_source) = match startup_config(&args, &repo) {
+        Ok(config) => config,
+        Err(error) => {
+            write_line(&mut io::stdout().lock(),
+                       &error_response(0, "invalid_config", &error, "ready"));
+            std::process::exit(2);
         }
-        None => config_json,
     };
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
     let limits = parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
-    let capabilities = parse_json(&proto::live_capabilities_impl()).unwrap_or_else(|| json!({}));
-    let mut ready_warnings = config_warnings.clone();
+    let capabilities =
+        parse_json(&proto::live_native_capabilities_impl()).unwrap_or_else(|| json!({}));
+    let mut ready_warnings: Vec<String> = Vec::new();
     if wasm_dir.is_empty() {
         ready_warnings.push(
             "bundled parsers NOT FOUND: pass --wasm-dir or set INTENTUMDIFF_WASM_DIR \
@@ -264,7 +278,7 @@ fn main() {
                     "repo_path": repo,
                     "ref": default_ref,
                     "limits": parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({})),
-                    "capabilities": parse_json(&proto::live_capabilities_impl())
+                    "capabilities": parse_json(&proto::live_native_capabilities_impl())
                         .unwrap_or_else(|| json!({})),
                 }),
             ),
@@ -272,11 +286,29 @@ fn main() {
                 &mut out,
                 &json!({ "op": "cancel", "seq": seq, "ok": true, "cancelled": 0 }),
             ),
+            "asset_diff" => {
+                let response = proto::live_handle_asset_diff_impl(&repo, &default_ref, &line, seq);
+                match parse_json(&response) {
+                    Some(value) => write_line(&mut out, &value),
+                    None => write_line(
+                        &mut out,
+                        &error_response(
+                            seq,
+                            "asset_error",
+                            "engine returned invalid JSON",
+                            "asset_diff",
+                        ),
+                    ),
+                }
+            }
             "diff" => {
                 let parsed = match proto::live_parse_diff_request_impl(&line, &default_ref) {
                     Ok(p) => p,
                     Err(e) => {
-                        write_line(&mut out, &error_response(seq, "invalid_request", &e, "diff"));
+                        write_line(
+                            &mut out,
+                            &error_response(seq, "invalid_request", &e, "diff"),
+                        );
                         continue;
                     }
                 };
@@ -302,11 +334,19 @@ fn main() {
                     .unwrap_or(&default_ref);
                 let start = std::time::Instant::now();
                 match proto::live_handle_diff_impl(
-                    &repo, path, git_ref, content, &config_json, &wasm_dir,
+                    &repo,
+                    path,
+                    git_ref,
+                    content,
+                    &config_json,
+                    &wasm_dir,
                 ) {
                     Ok(result) => {
                         let result: Value = parse_json(&result).unwrap_or_else(|| json!({}));
                         if let Some(diff) = result.get("diff") {
+                            // Completeness was already judged by Rust Core's
+                            // live_handle_diff_impl; this transport only shapes
+                            // a successful response and never reclassifies it.
                             let duration_ms =
                                 (start.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                             let change_count = diff
@@ -343,13 +383,17 @@ fn main() {
                                 .unwrap_or("engine returned no diff");
                             write_line(
                                 &mut out,
-                                &error_response(seq, "native_fallback", reason, "diff"),
+                                &error_response(
+                                    seq,
+                                    result.get("fallback_code").and_then(Value::as_str)
+                                        .unwrap_or("native_fallback"),
+                                    reason,
+                                    "diff",
+                                ),
                             );
                         }
                     }
-                    Err(e) => {
-                        write_line(&mut out, &error_response(seq, "diff_error", &e, "diff"))
-                    }
+                    Err(e) => write_line(&mut out, &error_response(seq, "diff_error", &e, "diff")),
                 }
             }
             "review" => {
@@ -372,7 +416,12 @@ fn main() {
                     None => {
                         write_line(
                             &mut out,
-                            &error_response(seq, "invalid_request", "unparseable request", "review"),
+                            &error_response(
+                                seq,
+                                "invalid_request",
+                                "unparseable request",
+                                "review",
+                            ),
                         );
                         continue;
                     }
@@ -383,7 +432,11 @@ fn main() {
                     .unwrap_or(&default_ref);
                 let new_ref = parsed.get("new_ref").and_then(Value::as_str).unwrap_or("");
                 match proto::live_handle_review_impl(
-                    &repo, old_ref, new_ref, &config_json, &wasm_dir,
+                    &repo,
+                    old_ref,
+                    new_ref,
+                    &config_json,
+                    &wasm_dir,
                 ) {
                     Ok(result) => {
                         let result: Value = parse_json(&result).unwrap_or_else(|| json!({}));
@@ -398,6 +451,27 @@ fn main() {
                                 .and_then(Value::as_array)
                                 .map(|a| a.len())
                                 .unwrap_or(0);
+                            // Keep engine-owned request metadata (including review fuel policy)
+                            // and supplement it with this transport's response summary.
+                            let mut metadata = result
+                                .get("metadata")
+                                .and_then(Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            metadata.entry("file_count").or_insert(json!(file_count));
+                            metadata
+                                .entry("guardrail_violation_count")
+                                .or_insert_with(|| {
+                                    json!(commit_diff
+                                        .get("guardrail_violations")
+                                        .and_then(Value::as_array)
+                                        .map(|values| values.len())
+                                        .unwrap_or(0))
+                                });
+                            metadata
+                                .entry("cross_file_change_count")
+                                .or_insert(json!(cross_count));
+                            metadata.insert("streamed".to_owned(), json!(false));
                             write_line(
                                 &mut out,
                                 &json!({
@@ -405,12 +479,7 @@ fn main() {
                                     "seq": seq,
                                     "ok": true,
                                     "commit_diff": commit_diff,
-                                    "metadata": {
-                                        "file_count": file_count,
-                                        "guardrail_violation_count": 0,
-                                        "cross_file_change_count": cross_count,
-                                        "streamed": false,
-                                    },
+                                    "metadata": metadata,
                                 }),
                             );
                         } else {
@@ -420,7 +489,13 @@ fn main() {
                                 .unwrap_or("engine returned no commit diff");
                             write_line(
                                 &mut out,
-                                &error_response(seq, "native_fallback", reason, "review"),
+                                &error_response(
+                                    seq,
+                                    result.get("fallback_code").and_then(Value::as_str)
+                                        .unwrap_or("native_fallback"),
+                                    reason,
+                                    "review",
+                                ),
                             );
                         }
                     }
