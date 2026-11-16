@@ -28,6 +28,11 @@ No IPC round-trip ever re-implements semantics.
 - Debounced re-diff on keystroke updates; bounded request sizes; explicit shutdown op so the
   editor can terminate the server cleanly (no orphan processes).
 
+- Startup validates the effective configuration (project `intentumdiff.yaml` or
+  `--config-json`, plus `--fuel`) before `ready`: unknown keys, wrong types, out-of-range and
+  unsupported values print `ready` with `ok:false`, `invalid_config`, and exit 2. A successful
+  `ready` reports the effective `config`.
+
 ## Ops
 
 The protocol mirrors the engine's live surface: capabilities/limits handshake, single-file

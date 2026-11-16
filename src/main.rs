@@ -22,6 +22,7 @@
 
 use std::io::{self, Write};
 
+mod config;
 mod framing;
 use framing::Frame;
 
@@ -156,8 +157,8 @@ fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str),
             (loaded, source)
         }
     };
-    // This shell only decodes the transport object to apply the CLI override.
-    // Interpretation and validation of engine options remain in Rust Core.
+    // This shell decodes the transport object to apply the CLI override; option semantics
+    // are validated by Core's validator (see src/config.rs).
     let mut config: Value = if raw.trim().is_empty() {
         json!({})
     } else {
@@ -170,6 +171,9 @@ fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str),
             .map_err(|_| "--fuel must be a signed integer".to_owned())?;
         fields.insert("plugin_fuel".to_owned(), json!(fuel));
     }
+    // Validate the EFFECTIVE config (project YAML or --config-json, plus --fuel) before
+    // `ready`, so a typo or bad value never announces readiness (#26).
+    config::validate(&config)?;
     Ok((config.to_string(), source))
 }
 
@@ -217,6 +221,8 @@ fn main() {
             "capabilities": capabilities,
             "wasm_dir": if wasm_dir.is_empty() { Value::Null } else { json!(wasm_dir) },
             "config_source": config_source,
+            // The effective, validated configuration every diff/review uses.
+            "config": parse_json(&config_json).unwrap_or_else(|| json!({})),
             "warnings": ready_warnings,
         }),
     );
