@@ -17,6 +17,10 @@ No IPC round-trip ever re-implements semantics.
   takes the current version (2); a supported integer is accepted; any other integer fails with
   `unsupported_protocol_version`, any non-integer with `invalid_protocol_version`. Responses
   (success and error) carry `supported_protocol_versions`, as does the `ready` line.
+- Framing is byte-level and bounded (`max_line_bytes`) before UTF-8 decoding. An oversized
+  frame gets `line_too_large`, a frame that is not UTF-8 gets `invalid_utf8` (both with
+  `seq` 0, `op` "error"); the session continues at the next `\n`. Clean stdin EOF exits 0;
+  a genuine stdin read failure emits `io_error` and exits 1.
 - Debounced re-diff on keystroke updates; bounded request sizes; explicit shutdown op so the
   editor can terminate the server cleanly (no orphan processes).
 

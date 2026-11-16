@@ -130,3 +130,80 @@ fn hello_uses_the_transport_coerced_seq() {
     assert_eq!(hello["seq"], 7, "{hello}");
     assert_eq!(hello["error"]["code"], "unsupported_protocol_version");
 }
+
+// --- frame decoding (#33): invalid UTF-8 is an isolated bad frame, not EOF ---
+
+fn hello_line(seq: i64) -> Vec<u8> {
+    line(json!({"op": "hello", "seq": seq}))
+}
+
+fn assert_invalid_utf8_then_hello(frame: &[u8]) {
+    let mut input = frame.to_vec();
+    input.extend(hello_line(9));
+    let (responses, output) = session(&input);
+    assert!(output.status.success(), "clean EOF must exit 0: {:?}", output.status);
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert_eq!(responses[0]["ok"], false, "{responses:?}");
+    assert_eq!(responses[0]["error"]["code"], "invalid_utf8", "{responses:?}");
+    assert_eq!(responses[1]["op"], "hello", "{responses:?}");
+    assert_eq!(responses[1]["seq"], 9);
+    assert_eq!(responses[1]["ok"], true);
+}
+
+#[test]
+fn invalid_utf8_frame_gets_one_error_and_the_session_recovers() {
+    assert_invalid_utf8_then_hello(b"\xff\n");
+}
+
+#[test]
+fn invalid_utf8_inside_a_json_string_gets_one_error_and_the_session_recovers() {
+    assert_invalid_utf8_then_hello(b"{\"op\":\"hello\",\"seq\":1,\"x\":\"a\xffb\"}\n");
+}
+
+#[test]
+fn invalid_utf8_with_crlf_and_truncated_sequence_recovers() {
+    assert_invalid_utf8_then_hello(b"\xe2\x82\r\n");
+}
+
+#[test]
+fn oversized_frame_is_rejected_without_losing_the_next_request() {
+    let mut input = vec![b'a'; 1_048_576 + 10];
+    input.push(b'\n');
+    input.extend(hello_line(10));
+    let (responses, output) = session(&input);
+    assert!(output.status.success());
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert_eq!(responses[0]["error"]["code"], "line_too_large");
+    assert_eq!(responses[1]["seq"], 10);
+    assert_eq!(responses[1]["ok"], true);
+}
+
+#[test]
+fn final_frame_without_newline_is_still_served_before_clean_eof() {
+    let (responses, output) = session(br#"{"op":"hello","seq":11}"#);
+    assert!(output.status.success());
+    assert_eq!(responses.len(), 1, "{responses:?}");
+    assert_eq!(responses[0]["seq"], 11);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stdin_read_failure_is_reported_and_distinct_from_clean_eof() {
+    // Reading a directory fd fails with EISDIR: a genuine I/O error, not end of input.
+    let repo = temp_repo();
+    let output = Command::new(env!("CARGO_BIN_EXE_intentumdiff-live-server"))
+        .arg("--repo")
+        .arg(&repo)
+        .stdin(std::fs::File::open(&repo).expect("open dir"))
+        .output()
+        .expect("run");
+    let _ = std::fs::remove_dir_all(&repo);
+    assert!(!output.status.success(), "read failure must not look like clean EOF");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(last["error"]["code"], "io_error", "{text}");
+    // Clean EOF, by contrast, exits 0 with no error line.
+    let (responses, output) = session(b"");
+    assert!(output.status.success());
+    assert!(responses.is_empty(), "{responses:?}");
+}

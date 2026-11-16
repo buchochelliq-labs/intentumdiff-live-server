@@ -20,7 +20,10 @@
 //!   finalize declined) surface honestly as `native_fallback` errors.
 //! - Clean shutdown on stdin EOF (#73: no threads, no handles to orphan).
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
+
+mod framing;
+use framing::Frame;
 
 use intentumdiff_rust_core::live_server as proto;
 use serde_json::{json, Value};
@@ -204,19 +207,38 @@ fn main() {
     );
 
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // stdin closed/errored -> clean shutdown
+    let mut input = stdin.lock();
+    let max_line_bytes = usize::try_from(proto::MAX_LINE_BYTES).unwrap_or(usize::MAX);
+    loop {
+        // Bounded byte framing BEFORE decoding (#33): a malformed frame is answered and
+        // skipped; only a clean EOF or a genuine read failure ends the session.
+        let line = match framing::read_frame(&mut input, max_line_bytes) {
+            Ok(Frame::Line(line)) => line,
+            Ok(Frame::Eof) => break, // clean shutdown (#73)
+            Ok(Frame::TooLarge) => {
+                write_line(
+                    &mut out,
+                    &error_response(0, "line_too_large", "request line exceeds limit", "error"),
+                );
+                continue;
+            }
+            Ok(Frame::InvalidUtf8) => {
+                write_line(
+                    &mut out,
+                    &error_response(0, "invalid_utf8", "request line is not valid UTF-8", "error"),
+                );
+                continue;
+            }
+            Err(error) => {
+                // Distinct from EOF: report it and exit nonzero so the client can tell.
+                write_line(
+                    &mut out,
+                    &error_response(0, "io_error", &format!("stdin read failed: {error}"), "error"),
+                );
+                std::process::exit(1);
+            }
         };
         if line.trim().is_empty() {
-            continue;
-        }
-        if line.len() as u64 > proto::MAX_LINE_BYTES {
-            write_line(
-                &mut out,
-                &error_response(0, "line_too_large", "request line exceeds limit", "error"),
-            );
             continue;
         }
 
