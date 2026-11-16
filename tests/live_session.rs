@@ -54,15 +54,21 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn unique_temp_dir() -> PathBuf {
+    // Tests run in parallel. A timestamp alone is not unique: macOS and Windows clocks are
+    // coarser than a nanosecond, so two tests starting together got the same directory and
+    // their concurrent `git init` collided. A per-process counter makes every name unique,
+    // and create_dir (not create_dir_all) refuses a directory that already exists.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "intentumdiff-live-it-{}-{nanos}",
+        "intentumdiff-live-it-{}-{nanos}-{n}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("unique temp dir");
     dir
 }
 

@@ -10,15 +10,19 @@ use std::process::{Command, Output, Stdio};
 use serde_json::{json, Value};
 
 fn temp_repo() -> PathBuf {
+    // Parallel tests: a coarse clock can repeat a timestamp, so add a per-process counter
+    // and refuse an existing directory (see live_session.rs unique_temp_dir).
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "intentumdiff-live-frames-{}-{nanos}",
+        "intentumdiff-live-frames-{}-{nanos}-{n}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("unique temp dir");
     dir
 }
 
