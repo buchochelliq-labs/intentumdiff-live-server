@@ -21,6 +21,10 @@ No IPC round-trip ever re-implements semantics.
   frame gets `line_too_large`, a frame that is not UTF-8 gets `invalid_utf8` (both with
   `seq` 0, `op` "error"); the session continues at the next `\n`. Clean stdin EOF exits 0;
   a genuine stdin read failure emits `io_error` and exits 1.
+- Requests are served synchronously in arrival order. `cancel` is accepted but cannot reach
+  in-flight work: capabilities advertise `cancel_interrupts: false` and cancel responses say
+  `cancelled: 0, interrupted: false`. Real interruption needs an engine-owned cancellation/
+  deadline hook through guest and native phases plus a reader decoupled from compute.
 - Debounced re-diff on keystroke updates; bounded request sizes; explicit shutdown op so the
   editor can terminate the server cleanly (no orphan processes).
 

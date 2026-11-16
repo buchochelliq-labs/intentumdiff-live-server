@@ -30,6 +30,7 @@ provenance identifying the native server, engine and parser source. The tarball 
 the executable permission and includes `wasm/` beside the binary, allowing zero-setup
 parser discovery. Consumers must pin the CI artifact identity and check its checksum.
 
-The native server currently uses stdio and terminal responses; cancellation acknowledges
-requests but does not interrupt synchronous computation. Runtime parsers may also be
+The native server currently uses stdio and terminal responses. Requests run to completion in
+order, so cancellation cannot interrupt work: `capabilities.cancel_interrupts` is `false` and
+every `cancel` is answered `{"ok":true,"cancelled":0,"interrupted":false}`. Runtime parsers may also be
 selected with `--wasm-dir` or `INTENTUMDIFF_WASM_DIR`.

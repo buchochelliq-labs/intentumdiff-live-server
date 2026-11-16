@@ -124,6 +124,22 @@ fn error_response(seq: i64, code: &str, message: &str, op: &str) -> Value {
 }
 
 
+/// This stdio transport reads and computes on one thread: a request runs to completion
+/// before the next line (including a `cancel`) is read, and the engine exposes no
+/// interruption hook for in-flight guest/native work. Cancellation therefore cannot
+/// interrupt anything; it is acknowledged as a no-op (#34).
+const CANCEL_INTERRUPTS: bool = false;
+
+/// Core's native capabilities plus the facts only this transport knows (#34).
+fn transport_capabilities() -> Value {
+    let mut capabilities =
+        parse_json(&proto::live_native_capabilities_impl()).unwrap_or_else(|| json!({}));
+    if let Some(fields) = capabilities.as_object_mut() {
+        fields.insert("cancel_interrupts".to_owned(), json!(CANCEL_INTERRUPTS));
+    }
+    capabilities
+}
+
 fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str), String> {
     let option = |flag: &str| -> Result<Option<String>, String> {
         match args.iter().position(|arg| arg == flag) {
@@ -175,8 +191,7 @@ fn main() {
     let mut out = stdout.lock();
 
     let limits = parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
-    let capabilities =
-        parse_json(&proto::live_native_capabilities_impl()).unwrap_or_else(|| json!({}));
+    let capabilities = transport_capabilities();
     let mut ready_warnings: Vec<String> = Vec::new();
     if wasm_dir.is_empty() {
         ready_warnings.push(
@@ -302,15 +317,22 @@ fn main() {
                     response["ref"] = json!(default_ref);
                     response["limits"] =
                         parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
-                    response["capabilities"] =
-                        parse_json(&proto::live_native_capabilities_impl())
-                            .unwrap_or_else(|| json!({}));
+                    response["capabilities"] = transport_capabilities();
                 }
                 write_line(&mut out, &response);
             }
+            // Requests run to completion in order (see CANCEL_INTERRUPTS), so by the time a
+            // cancel is read, every earlier request has already been answered: nothing is
+            // pending and nothing is interrupted. Say exactly that instead of implying it.
             "cancel" => write_line(
                 &mut out,
-                &json!({ "op": "cancel", "seq": seq, "ok": true, "cancelled": 0 }),
+                &json!({
+                    "op": "cancel",
+                    "seq": seq,
+                    "ok": true,
+                    "cancelled": 0,
+                    "interrupted": false,
+                }),
             ),
             "asset_diff" => {
                 let response = proto::live_handle_asset_diff_impl(&repo, &default_ref, &line, seq);

@@ -170,6 +170,7 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(ready["capabilities"]["stream"], false);
     assert_eq!(ready["capabilities"]["review_streaming"], false);
     assert_eq!(ready["capabilities"]["edit_deltas"], false);
+    assert_eq!(ready["capabilities"]["cancel_interrupts"], false);
 
     // 2. hello echoes the protocol handshake.
     s.send(&json!({"op": "hello", "seq": 1}));
@@ -219,6 +220,8 @@ fn native_live_server_serves_the_protocol() {
     let cancel = s.recv();
     assert_eq!(cancel["op"], "cancel");
     assert_eq!(cancel["ok"], true);
+    assert_eq!(cancel["cancelled"], 0);
+    assert_eq!(cancel["interrupted"], false);
 
     std::fs::write(repo.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
     git(&repo, &["add", "card.png"]);

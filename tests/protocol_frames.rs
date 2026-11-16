@@ -207,3 +207,45 @@ fn stdin_read_failure_is_reported_and_distinct_from_clean_eof() {
     assert!(output.status.success());
     assert!(responses.is_empty(), "{responses:?}");
 }
+
+// --- cancellation (#34): the synchronous transport must not imply it can interrupt ---
+
+#[test]
+fn capabilities_state_that_cancel_does_not_interrupt_in_flight_work() {
+    let (responses, _) = session(&hello_line(1));
+    let hello = &responses[0];
+    assert_eq!(hello["capabilities"]["cancel_interrupts"], false, "{hello}");
+    // The cancel op itself stays available (a no-op acknowledgement).
+    assert!(hello["capabilities"]["operations"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("cancel")));
+}
+
+#[test]
+fn cancel_acknowledges_without_claiming_an_interrupt_and_the_session_continues() {
+    let mut input = Vec::new();
+    // A request that completes (here: fails fast) before the cancel is read...
+    input.extend(line(json!({"op": "diff", "seq": 5, "path": "a.py", "content": "x = 1\n"})));
+    // ...its cancel (already completed), a cancel for an unknown target, a path cancel...
+    input.extend(line(json!({"op": "cancel", "seq": 5})));
+    input.extend(line(json!({"op": "cancel", "seq": 424242})));
+    input.extend(line(json!({"op": "cancel", "seq": 6, "path": "a.py"})));
+    // ...and an immediate next request.
+    input.extend(hello_line(7));
+    let (responses, output) = session(&input);
+    assert!(output.status.success());
+    assert_eq!(responses.len(), 5, "{responses:?}");
+    assert_eq!(responses[0]["op"], "diff");
+    assert_eq!(responses[0]["seq"], 5);
+    for (cancel, seq) in responses[1..4].iter().zip([5, 424242, 6]) {
+        assert_eq!(cancel["op"], "cancel", "{cancel}");
+        assert_eq!(cancel["seq"], seq, "{cancel}");
+        assert_eq!(cancel["ok"], true, "{cancel}");
+        assert_eq!(cancel["cancelled"], 0, "{cancel}");
+        assert_eq!(cancel["interrupted"], false, "{cancel}");
+    }
+    assert_eq!(responses[4]["op"], "hello");
+    assert_eq!(responses[4]["seq"], 7);
+    assert_eq!(responses[4]["ok"], true);
+}
