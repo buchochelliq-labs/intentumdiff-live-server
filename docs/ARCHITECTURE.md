@@ -13,6 +13,10 @@ No IPC round-trip ever re-implements semantics.
   DACL (owner-only) so other local users cannot connect.
 - Line-delimited JSON requests/responses with sequence numbers; unsupported protocol versions
   and malformed requests return structured error responses (never a crash).
+- `hello` negotiation is Core's `live_negotiate_protocol`: an absent/null `protocol_version`
+  takes the current version (2); a supported integer is accepted; any other integer fails with
+  `unsupported_protocol_version`, any non-integer with `invalid_protocol_version`. Responses
+  (success and error) carry `supported_protocol_versions`, as does the `ready` line.
 - Debounced re-diff on keystroke updates; bounded request sizes; explicit shutdown op so the
   editor can terminate the server cleanly (no orphan processes).
 

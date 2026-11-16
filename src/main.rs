@@ -190,7 +190,8 @@ fn main() {
         &json!({
             "op": "ready",
             "ok": true,
-            "protocol_version": 2,
+            "protocol_version": proto::LIVE_PROTOCOL_VERSION,
+            "supported_protocol_versions": proto::LIVE_SUPPORTED_PROTOCOL_VERSIONS,
             "transport": "stdio",
             "repo_path": repo,
             "ref": default_ref,
@@ -268,20 +269,23 @@ fn main() {
         }
 
         match op {
-            "hello" => write_line(
-                &mut out,
-                &json!({
-                    "op": "hello",
-                    "seq": seq,
-                    "ok": true,
-                    "protocol_version": 2,
-                    "repo_path": repo,
-                    "ref": default_ref,
-                    "limits": parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({})),
-                    "capabilities": parse_json(&proto::live_native_capabilities_impl())
-                        .unwrap_or_else(|| json!({})),
-                }),
-            ),
+            "hello" => {
+                // Version negotiation is Core's single rule (core #260); this transport only
+                // supplies the already-coerced seq and adds its own context on success.
+                let mut hello = request.clone();
+                hello["seq"] = json!(seq);
+                let mut response = proto::live_negotiate_protocol_impl(&hello);
+                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                    response["repo_path"] = json!(repo);
+                    response["ref"] = json!(default_ref);
+                    response["limits"] =
+                        parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
+                    response["capabilities"] =
+                        parse_json(&proto::live_native_capabilities_impl())
+                            .unwrap_or_else(|| json!({}));
+                }
+                write_line(&mut out, &response);
+            }
             "cancel" => write_line(
                 &mut out,
                 &json!({ "op": "cancel", "seq": seq, "ok": true, "cancelled": 0 }),
