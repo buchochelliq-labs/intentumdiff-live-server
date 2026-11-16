@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "intentumdiff-live-server"
-version = "0.1.0"
+version = "0.0.3-beta.1"
 dependencies = [
  "intentumdiff-rust-core",
  "serde_json",

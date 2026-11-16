@@ -215,6 +215,8 @@ fn main() {
             "protocol_version": proto::LIVE_PROTOCOL_VERSION,
             "supported_protocol_versions": proto::LIVE_SUPPORTED_PROTOCOL_VERSIONS,
             "transport": "stdio",
+            // Cargo SemVer prerelease form of the product version (0.0.3-beta.1 == 0.0.3b1).
+            "server_version": env!("CARGO_PKG_VERSION"),
             "repo_path": repo,
             "ref": default_ref,
             "limits": limits,

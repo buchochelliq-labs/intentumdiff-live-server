@@ -53,6 +53,7 @@ fn session(input: &[u8]) -> (Vec<Value>, Output) {
     assert_eq!(ready["ok"], true, "{ready}");
     assert_eq!(ready["protocol_version"], 2, "{ready}");
     assert_eq!(ready["supported_protocol_versions"], json!([2]), "{ready}");
+    assert_eq!(ready["server_version"], env!("CARGO_PKG_VERSION"), "{ready}");
     (lines, output)
 }
 
