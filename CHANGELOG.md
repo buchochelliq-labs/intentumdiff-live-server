@@ -4,7 +4,14 @@ Versions use the product version in Cargo SemVer form (`0.0.3-beta.1` is product
 
 ## 0.0.3-beta.1 (unreleased)
 
-- Engine pinned to intentumdiff-core `release/v0.0.3-rc` (`e60a55c`).
+- Engine pinned to intentumdiff-core `74618c3` (core #252, core PR #312: review completeness).
+  The reviewed parser wheel is still the one built at core `e60a55c`; it is re-pinned
+  separately, and until then the CI `require_matching_native_core` gate fails closed.
+- Review frames forward core #252's `completeness`, `incomplete` (including the sanitised
+  `report`) and `metadata.equivalence_proof` verbatim: `diff.diff` and every
+  `review.commit_diff.file_diffs[]` entry. Additive within protocol v2; the envelope is
+  unchanged for complete and equivalent reviews. The server never opens `report.issue_url`
+  or sends a report.
 - `hello` negotiates `protocol_version` through Core (`unsupported_protocol_version`,
   `invalid_protocol_version`, `supported_protocol_versions`).
 - Bounded byte framing: invalid UTF-8 frames get `invalid_utf8` and the session continues;
