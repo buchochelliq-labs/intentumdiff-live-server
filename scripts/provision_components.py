@@ -14,12 +14,12 @@ import urllib.parse
 import zipfile
 
 IDENTITY = {
-    "python_commit": "110e793ace835c91ad9a4bfb390cb1fd06b4b147",
-    "component_core_commit": "726fd07c77a83d2554d3eca68b6469e9461b87bc",
-    "wheel_sha256": "8bf9cf778a315e54b6c62fd00029c1c73c555d30fe8d39acd7a190e098dc0319",
-    "artifact_id": 13306565586,
-    "archive_sha256": "9bdffcf054a9931b3c0d31ec233f24fa92ed0cfd141694aa0e6b691db5fc8725",
-    "workflow_run": 41790266216,
+    "python_commit": "b8b86d6be05bfa38f4e6191420cb186bfbf7a498",
+    "component_core_commit": "e60a55cf62b887d03acb553188bed98074480ec6",
+    "wheel_sha256": "335bc5cda8ea721bcc5a876f4e08c70d11668de9637e355d03bb6e7bba654269",
+    "artifact_id": 13907305325,
+    "archive_sha256": "86681311fc09ecb83ba3486160fb88bf8b8ad8aa2a5bafcee76bd1fc9057976b",
+    "workflow_run": 43126476011,
 }
 
 
@@ -34,7 +34,7 @@ def require_matching_native_core(native_core_rev: str) -> None:
 
 # GitHub PR CI tests the synthetic merge tree, not the branch head.
 # Its evidence/python-tested-commit.txt MUST match IDENTITY.python_commit.
-EXPECTED_WHEEL_PATH = "dist/intentumdiff_python-0.0.2b2-py3-none-manylinux_2_39_x86_64.whl"
+EXPECTED_WHEEL_PATH = "dist/intentumdiff_python-0.0.3b1-py3-none-manylinux_2_39_x86_64.whl"
 
 
 def extract_verified_ci_wheel(data: bytes) -> bytes:

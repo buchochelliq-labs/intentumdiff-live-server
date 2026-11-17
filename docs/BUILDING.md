@@ -25,11 +25,21 @@ The wheel supplies build inputs only: the shipped runtime contains no Python pac
 interpreter. If the upstream CI artifact expires, provisioning fails closed; update its
 immutable identity only after verifying replacement components.
 
-CI produces `native-linux-x64-<server commit>` containing a tarball, its SHA-256 and
-provenance identifying the native server, engine and parser source. The tarball preserves
-the executable permission and includes `wasm/` beside the binary, allowing zero-setup
-parser discovery. Consumers must pin the CI artifact identity and check its checksum.
+CI builds and tests one native runtime per supported VS Code target — `linux-x64`,
+`linux-arm64`, `darwin-x64`, `darwin-arm64`, `win32-x64`, `win32-arm64` — on a native runner
+for each, and uploads `native-<platform>-<server commit>`: an archive
+(`intentumdiff-live-server-<platform>.tar.gz`, `.zip` on Windows), its `SHA256SUMS`, and
+`provenance.json` identifying the server commit and version, platform, Rust target, engine
+and parser source. The archive preserves the executable permission, includes `wasm/` beside
+the binary (zero-setup parser discovery) and an inner `SHA256SUMS`. Consumers must pin the
+CI artifact identity and check its checksum (`python scripts/package_native.py --verify DIR`).
+These are CI artifacts only; nothing is published to a release from this workflow.
 
-The native server currently uses stdio and terminal responses; cancellation acknowledges
-requests but does not interrupt synchronous computation. Runtime parsers may also be
+Versioning: `Cargo.toml` carries the product version in SemVer prerelease form
+(`0.0.3-beta.1` is product `0.0.3b1`). It is reported as `server_version` in the `ready`
+line and in `provenance.json`.
+
+The native server currently uses stdio and terminal responses. Requests run to completion in
+order, so cancellation cannot interrupt work: `capabilities.cancel_interrupts` is `false` and
+every `cancel` is answered `{"ok":true,"cancelled":0,"interrupted":false}`. Runtime parsers may also be
 selected with `--wasm-dir` or `INTENTUMDIFF_WASM_DIR`.

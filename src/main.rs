@@ -20,7 +20,11 @@
 //!   finalize declined) surface honestly as `native_fallback` errors.
 //! - Clean shutdown on stdin EOF (#73: no threads, no handles to orphan).
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
+
+mod config;
+mod framing;
+use framing::Frame;
 
 use intentumdiff_rust_core::live_server as proto;
 use serde_json::{json, Value};
@@ -121,6 +125,22 @@ fn error_response(seq: i64, code: &str, message: &str, op: &str) -> Value {
 }
 
 
+/// This stdio transport reads and computes on one thread: a request runs to completion
+/// before the next line (including a `cancel`) is read, and the engine exposes no
+/// interruption hook for in-flight guest/native work. Cancellation therefore cannot
+/// interrupt anything; it is acknowledged as a no-op (#34).
+const CANCEL_INTERRUPTS: bool = false;
+
+/// Core's native capabilities plus the facts only this transport knows (#34).
+fn transport_capabilities() -> Value {
+    let mut capabilities =
+        parse_json(&proto::live_native_capabilities_impl()).unwrap_or_else(|| json!({}));
+    if let Some(fields) = capabilities.as_object_mut() {
+        fields.insert("cancel_interrupts".to_owned(), json!(CANCEL_INTERRUPTS));
+    }
+    capabilities
+}
+
 fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str), String> {
     let option = |flag: &str| -> Result<Option<String>, String> {
         match args.iter().position(|arg| arg == flag) {
@@ -137,8 +157,8 @@ fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str),
             (loaded, source)
         }
     };
-    // This shell only decodes the transport object to apply the CLI override.
-    // Interpretation and validation of engine options remain in Rust Core.
+    // This shell decodes the transport object to apply the CLI override; option semantics
+    // are validated by Core's validator (see src/config.rs).
     let mut config: Value = if raw.trim().is_empty() {
         json!({})
     } else {
@@ -151,6 +171,9 @@ fn startup_config(args: &[String], repo: &str) -> Result<(String, &'static str),
             .map_err(|_| "--fuel must be a signed integer".to_owned())?;
         fields.insert("plugin_fuel".to_owned(), json!(fuel));
     }
+    // Validate the EFFECTIVE config (project YAML or --config-json, plus --fuel) before
+    // `ready`, so a typo or bad value never announces readiness (#26).
+    config::validate(&config)?;
     Ok((config.to_string(), source))
 }
 
@@ -172,8 +195,7 @@ fn main() {
     let mut out = stdout.lock();
 
     let limits = parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
-    let capabilities =
-        parse_json(&proto::live_native_capabilities_impl()).unwrap_or_else(|| json!({}));
+    let capabilities = transport_capabilities();
     let mut ready_warnings: Vec<String> = Vec::new();
     if wasm_dir.is_empty() {
         ready_warnings.push(
@@ -190,32 +212,56 @@ fn main() {
         &json!({
             "op": "ready",
             "ok": true,
-            "protocol_version": 2,
+            "protocol_version": proto::LIVE_PROTOCOL_VERSION,
+            "supported_protocol_versions": proto::LIVE_SUPPORTED_PROTOCOL_VERSIONS,
             "transport": "stdio",
+            // Cargo SemVer prerelease form of the product version (0.0.3-beta.1 == 0.0.3b1).
+            "server_version": env!("CARGO_PKG_VERSION"),
             "repo_path": repo,
             "ref": default_ref,
             "limits": limits,
             "capabilities": capabilities,
             "wasm_dir": if wasm_dir.is_empty() { Value::Null } else { json!(wasm_dir) },
             "config_source": config_source,
+            // The effective, validated configuration every diff/review uses.
+            "config": parse_json(&config_json).unwrap_or_else(|| json!({})),
             "warnings": ready_warnings,
         }),
     );
 
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // stdin closed/errored -> clean shutdown
+    let mut input = stdin.lock();
+    let max_line_bytes = usize::try_from(proto::MAX_LINE_BYTES).unwrap_or(usize::MAX);
+    loop {
+        // Bounded byte framing BEFORE decoding (#33): a malformed frame is answered and
+        // skipped; only a clean EOF or a genuine read failure ends the session.
+        let line = match framing::read_frame(&mut input, max_line_bytes) {
+            Ok(Frame::Line(line)) => line,
+            Ok(Frame::Eof) => break, // clean shutdown (#73)
+            Ok(Frame::TooLarge) => {
+                write_line(
+                    &mut out,
+                    &error_response(0, "line_too_large", "request line exceeds limit", "error"),
+                );
+                continue;
+            }
+            Ok(Frame::InvalidUtf8) => {
+                write_line(
+                    &mut out,
+                    &error_response(0, "invalid_utf8", "request line is not valid UTF-8", "error"),
+                );
+                continue;
+            }
+            Err(error) => {
+                // Distinct from EOF: report it and exit nonzero so the client can tell.
+                write_line(
+                    &mut out,
+                    &error_response(0, "io_error", &format!("stdin read failed: {error}"), "error"),
+                );
+                std::process::exit(1);
+            }
         };
         if line.trim().is_empty() {
-            continue;
-        }
-        if line.len() as u64 > proto::MAX_LINE_BYTES {
-            write_line(
-                &mut out,
-                &error_response(0, "line_too_large", "request line exceeds limit", "error"),
-            );
             continue;
         }
 
@@ -268,23 +314,33 @@ fn main() {
         }
 
         match op {
-            "hello" => write_line(
-                &mut out,
-                &json!({
-                    "op": "hello",
-                    "seq": seq,
-                    "ok": true,
-                    "protocol_version": 2,
-                    "repo_path": repo,
-                    "ref": default_ref,
-                    "limits": parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({})),
-                    "capabilities": parse_json(&proto::live_native_capabilities_impl())
-                        .unwrap_or_else(|| json!({})),
-                }),
-            ),
+            "hello" => {
+                // Version negotiation is Core's single rule (core #260); this transport only
+                // supplies the already-coerced seq and adds its own context on success.
+                let mut hello = request.clone();
+                hello["seq"] = json!(seq);
+                let mut response = proto::live_negotiate_protocol_impl(&hello);
+                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                    response["repo_path"] = json!(repo);
+                    response["ref"] = json!(default_ref);
+                    response["limits"] =
+                        parse_json(&proto::live_limits_impl()).unwrap_or_else(|| json!({}));
+                    response["capabilities"] = transport_capabilities();
+                }
+                write_line(&mut out, &response);
+            }
+            // Requests run to completion in order (see CANCEL_INTERRUPTS), so by the time a
+            // cancel is read, every earlier request has already been answered: nothing is
+            // pending and nothing is interrupted. Say exactly that instead of implying it.
             "cancel" => write_line(
                 &mut out,
-                &json!({ "op": "cancel", "seq": seq, "ok": true, "cancelled": 0 }),
+                &json!({
+                    "op": "cancel",
+                    "seq": seq,
+                    "ok": true,
+                    "cancelled": 0,
+                    "interrupted": false,
+                }),
             ),
             "asset_diff" => {
                 let response = proto::live_handle_asset_diff_impl(&repo, &default_ref, &line, seq);

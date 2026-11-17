@@ -54,15 +54,21 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn unique_temp_dir() -> PathBuf {
+    // Tests run in parallel. A timestamp alone is not unique: macOS and Windows clocks are
+    // coarser than a nanosecond, so two tests starting together got the same directory and
+    // their concurrent `git init` collided. A per-process counter makes every name unique,
+    // and create_dir (not create_dir_all) refuses a directory that already exists.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "intentumdiff-live-it-{}-{nanos}",
+        "intentumdiff-live-it-{}-{nanos}-{n}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("unique temp dir");
     dir
 }
 
@@ -170,6 +176,7 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(ready["capabilities"]["stream"], false);
     assert_eq!(ready["capabilities"]["review_streaming"], false);
     assert_eq!(ready["capabilities"]["edit_deltas"], false);
+    assert_eq!(ready["capabilities"]["cancel_interrupts"], false);
 
     // 2. hello echoes the protocol handshake.
     s.send(&json!({"op": "hello", "seq": 1}));
@@ -219,6 +226,8 @@ fn native_live_server_serves_the_protocol() {
     let cancel = s.recv();
     assert_eq!(cancel["op"], "cancel");
     assert_eq!(cancel["ok"], true);
+    assert_eq!(cancel["cancelled"], 0);
+    assert_eq!(cancel["interrupted"], false);
 
     std::fs::write(repo.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
     git(&repo, &["add", "card.png"]);
@@ -821,4 +830,83 @@ fn native_python_comment_only_edit_is_served_as_style_only() {
     assert_eq!(r["ok"], true, "comment-only Python edit must be served: {r}");
     assert_eq!(r["diff"]["is_style_only"], true, "{r}");
     assert_eq!(r["diff"]["has_semantic_changes"], false, "{r}");
+}
+
+// ---------------------------------------------------------------------------
+// #26: the EFFECTIVE startup configuration (project YAML, --config-json, --fuel) is
+// validated before `ready`; unknown keys, wrong types, out-of-range and unsupported
+// values fail with invalid_config (exit 2) instead of announcing readiness.
+// ---------------------------------------------------------------------------
+
+fn assert_config_rejected_naming(output: std::process::Output, needle: &str) {
+    assert_eq!(output.status.code(), Some(2), "invalid config must exit 2");
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(text.contains(needle), "error should name {needle:?}: {text}");
+    assert_config_rejected(output);
+}
+
+#[test]
+fn startup_rejects_invalid_config_json_before_ready() {
+    let repo = unique_temp_dir();
+    for (config, needle) in [
+        (r#"{"bogus_key":1}"#, "bogus_key"),
+        (r#"{"unknown_audit_key":1}"#, "unknown_audit_key"),
+        (r#"{"ignore_styel":true}"#, "ignore_styel"),
+        (r#"{"plugin_fuel":"x"}"#, "plugin_fuel"),
+        (r#"{"plugin_fuel":"bad"}"#, "plugin_fuel"),
+        (r#"{"min_similarity":2}"#, "min_similarity"),
+        (r#"{"max_nodes":-1}"#, "max_nodes"),
+        (r#"{"detect_refactorings":false}"#, "detect_refactorings"),
+        (r#"{"guardrails_enabled":"false"}"#, "guardrails_enabled"),
+        (r#"{"guardrail_policy_path":7}"#, "guardrail_policy_path"),
+        (r#"{"strict_plugins":"yes"}"#, "strict_plugins"),
+        (r#"{"allowed_plugins":"python"}"#, "allowed_plugins"),
+    ] {
+        assert_config_rejected_naming(startup(&repo, &["--config-json", config]), needle);
+    }
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn startup_rejects_invalid_project_yaml_values_before_ready() {
+    for (yaml, needle) in [
+        ("config:\n  plugin_fuel: bad\n", "plugin_fuel"),
+        ("config:\n  min_similarity: 2\n", "min_similarity"),
+        ("config:\n  detect_refactorings: false\n", "detect_refactorings"),
+        ("config:\n  bogus_key: 1\n", "bogus_key"),
+    ] {
+        let repo = unique_temp_dir();
+        std::fs::write(repo.join("intentumdiff.yaml"), yaml).unwrap();
+        assert_config_rejected_naming(startup(&repo, &[]), needle);
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+#[test]
+fn startup_accepts_valid_overrides_and_reports_the_effective_config() {
+    let repo = unique_temp_dir();
+    let output = startup(
+        &repo,
+        &[
+            "--config-json",
+            r#"{"min_similarity":0.7,"max_nodes":100,"guardrails_enabled":false,"detect_refactorings":true,"strict_plugins":true,"allowed_plugins":["python"]}"#,
+            "--fuel",
+            "1234",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let ready: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(ready["ok"], true, "{ready}");
+    assert_eq!(ready["config_source"], "flag");
+    assert_eq!(ready["config"]["min_similarity"], 0.7, "{ready}");
+    assert_eq!(ready["config"]["max_nodes"], 100);
+    assert_eq!(ready["config"]["plugin_fuel"], 1234);
+    assert_eq!(ready["config"]["guardrails_enabled"], false);
+    std::fs::write(repo.join("intentumdiff.yaml"), "config:\n  min_similarity: 0.6\n  plugin_fuel: 10_000\n").unwrap();
+    let ready: Value = serde_json::from_slice(&startup(&repo, &[]).stdout).unwrap();
+    assert_eq!(ready["ok"], true, "{ready}");
+    assert_eq!(ready["config_source"], "intentumdiff.yaml");
+    assert_eq!(ready["config"]["min_similarity"], 0.6, "{ready}");
+    assert_eq!(ready["config"]["plugin_fuel"], 10000);
+    std::fs::remove_dir_all(repo).unwrap();
 }
