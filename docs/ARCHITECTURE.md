@@ -33,6 +33,22 @@ No IPC round-trip ever re-implements semantics.
   unsupported values print `ready` with `ok:false`, `invalid_config`, and exit 2. A successful
   `ready` reports the effective `config`.
 
+## Review completeness (core #252)
+
+Every served review carries core's `completeness` (`complete` | `equivalent` | `incomplete`),
+`incomplete` (`null`, or core's object with `reason`, `message`, `report_url`, `language`,
+`core_version`, `source_ranges` and the sanitised `report`) and `metadata.equivalence_proof`.
+The `diff` response's `diff` and each `review` response's `commit_diff.file_diffs[]` carry
+them exactly as core produced them; this transport neither adds, renames nor recomputes any
+of them, and the response envelope (`op`, `seq`, `ok`, `metadata` summary) is the same for all
+three states. The fields are additive within **protocol version 2** (no version bump: a v2
+client that ignores them still parses every frame). An `incomplete` review has
+`changes: []` and `metadata.change_count: 0` but is NOT clean: clients must render
+`incomplete.message`. The server never opens `report.issue_url` or sends a report; per
+[C_ABI.md](https://github.com/buchochelliq-labs/intentumdiff-core/blob/main/docs/C_ABI.md#review-completeness-core-252)
+the client must preview `report.title`/`report.body_markdown` and get explicit user
+confirmation before opening it.
+
 ## Ops
 
 The protocol mirrors the engine's live surface: capabilities/limits handshake, single-file

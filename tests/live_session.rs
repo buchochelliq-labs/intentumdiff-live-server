@@ -910,3 +910,149 @@ fn startup_accepts_valid_overrides_and_reports_the_effective_config() {
     assert_eq!(ready["config"]["plugin_fuel"], 10000);
     std::fs::remove_dir_all(repo).unwrap();
 }
+
+// ── core #252: review completeness is forwarded verbatim ────────────────────────────────
+
+/// A committed `files` fixture; returns the repo.
+fn completeness_repo(files: &[(&str, &str)]) -> PathBuf {
+    assert!(git_available(), "git is required for protocol verification");
+    let base = unique_temp_dir();
+    git(&base, &["init"]);
+    git(&base, &["config", "user.email", "t@example.com"]);
+    git(&base, &["config", "user.name", "T"]);
+    for (path, text) in files {
+        std::fs::write(base.join(path), text).unwrap();
+    }
+    git(&base, &["add", "."]);
+    git(&base, &["commit", "-m", "base"]);
+    base
+}
+
+/// The three core #252 fields of a served review.
+fn completeness_fields(diff: &Value) -> Value {
+    json!({
+        "completeness": diff["completeness"],
+        "incomplete": diff["incomplete"],
+        "equivalence_proof": diff["metadata"]["equivalence_proof"],
+    })
+}
+
+/// The diff frame for `new` against the committed `old`, plus the linked core's own
+/// answer for the identical request (the server's startup config is `{}` here).
+fn diff_frame_and_core(path: &str, old: &str, new: &str) -> (Value, Value) {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let repo = completeness_repo(&[(path, old)]);
+    let mut session = spawn(env!("CARGO_BIN_EXE_intentumdiff-live-server"), &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "diff", "seq": 1, "path": path, "content": new, "ref": "HEAD"}));
+    let frame = session.recv();
+    drop(session.stdin);
+    let _ = session.child.wait();
+    let core: Value = serde_json::from_str(
+        &intentumdiff_rust_core::live_server::live_handle_diff_impl(
+            &repo.to_string_lossy(), path, "HEAD", new, "{}", &wasm_dir.to_string_lossy(),
+        ).expect("core diff"),
+    ).unwrap();
+    let _ = std::fs::remove_dir_all(repo);
+    (frame, core)
+}
+
+fn frame_keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// The transport envelope is the same for every completeness state: the review travels
+/// inside `diff` exactly as core produced it, and the server adds nothing of its own
+/// (in particular no URL handling: core never sends anything and neither does the server).
+fn assert_forwarded_verbatim(frame: &Value, core: &Value, completeness: &str) {
+    assert_eq!(frame["ok"], true, "{frame}");
+    assert_eq!(frame_keys(frame), ["diff", "metadata", "ok", "op", "seq"], "{frame}");
+    assert_eq!(
+        frame_keys(&frame["metadata"]),
+        ["change_count", "duration_ms", "guardrail_violation_count", "language", "style_only"],
+        "{frame}"
+    );
+    assert_eq!(frame["diff"]["completeness"], completeness, "{frame}");
+    assert_eq!(completeness_fields(&frame["diff"]), completeness_fields(&core["diff"]), "{frame}");
+}
+
+#[test]
+fn an_incomplete_review_frame_carries_the_core_fields_verbatim() {
+    // An array-element reorder the engine cannot explain (core #252): incomplete.
+    let (frame, core) = diff_frame_and_core("a.ts", "const a = [1, 2];\n", "const a = [2, 1];\n");
+    assert_forwarded_verbatim(&frame, &core, "incomplete");
+    let diff = &frame["diff"];
+    assert_eq!(diff["incomplete"], core["diff"]["incomplete"], "the whole object, verbatim");
+    let incomplete = &diff["incomplete"];
+    assert_eq!(incomplete["reason"], "unexplained_source_delta");
+    assert!(incomplete["message"].as_str().unwrap().contains("could not explain"));
+    assert!(!incomplete["source_ranges"].as_array().unwrap().is_empty(), "{incomplete}");
+    let report = &incomplete["report"];
+    for field in ["title", "body_markdown", "issue_url"] {
+        assert!(report[field].is_string(), "report.{field}: {report}");
+    }
+    assert!(report["truncated"].is_boolean() && report["outline"].is_object(), "{report}");
+    assert_eq!(incomplete["report_url"], report["issue_url"]);
+    // Core never fabricates changes for it, and the transport does not either.
+    assert_eq!(diff["changes"], json!([]));
+    assert_eq!(frame["metadata"]["change_count"], 0);
+}
+
+#[test]
+fn complete_and_equivalent_review_frames_are_unchanged() {
+    let (frame, core) =
+        diff_frame_and_core("a.ts", "const x: number = 1;\n", "const x: number = 2;\n");
+    assert_forwarded_verbatim(&frame, &core, "complete");
+    assert!(frame["diff"]["incomplete"].is_null(), "{frame}");
+    assert!(frame["metadata"]["change_count"].as_u64().unwrap() > 0, "{frame}");
+
+    // Byte-identical input is `complete`, never `equivalent`.
+    let (frame, core) = diff_frame_and_core("a.ts", "const x = 1;\n", "const x = 1;\n");
+    assert_forwarded_verbatim(&frame, &core, "complete");
+    assert!(frame["diff"]["incomplete"].is_null(), "{frame}");
+
+    // A proved equivalence (unordered mapping member order) keeps core's proof.
+    let (frame, core) =
+        diff_frame_and_core("a.json", "{\"a\": 1, \"b\": 2}\n", "{\"b\": 2, \"a\": 1}\n");
+    assert_forwarded_verbatim(&frame, &core, "equivalent");
+    assert!(frame["diff"]["incomplete"].is_null(), "{frame}");
+    assert!(frame["diff"]["metadata"]["equivalence_proof"].is_string(), "{frame}");
+}
+
+#[test]
+fn review_frames_forward_each_file_completeness_verbatim() {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let repo = completeness_repo(&[
+        ("lost.ts", "const a = [1, 2];\n"),
+        ("kept.ts", "const x: number = 1;\n"),
+    ]);
+    std::fs::write(repo.join("lost.ts"), "const a = [2, 1];\n").unwrap();
+    std::fs::write(repo.join("kept.ts"), "const x: number = 2;\n").unwrap();
+    let mut session = spawn(env!("CARGO_BIN_EXE_intentumdiff-live-server"), &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD"}));
+    let frame = session.recv();
+    drop(session.stdin);
+    let _ = session.child.wait();
+    let core: Value = serde_json::from_str(
+        &intentumdiff_rust_core::live_server::live_handle_review_impl(
+            &repo.to_string_lossy(), "HEAD", "", "{}", &wasm_dir.to_string_lossy(),
+        ).expect("core review"),
+    ).unwrap();
+    let _ = std::fs::remove_dir_all(&repo);
+    assert_eq!(frame["ok"], true, "{frame}");
+    let by_name = |v: &Value, name: &str| -> Value {
+        v["commit_diff"]["file_diffs"].as_array().unwrap().iter()
+            .find(|f| f["new_filename"] == name).cloned()
+            .unwrap_or_else(|| panic!("{name} missing: {v}"))
+    };
+    for (name, state) in [("lost.ts", "incomplete"), ("kept.ts", "complete")] {
+        let served = by_name(&frame, name);
+        assert_eq!(served["completeness"], state, "{name}: {served}");
+        assert_eq!(completeness_fields(&served), completeness_fields(&by_name(&core, name)), "{name}");
+    }
+}

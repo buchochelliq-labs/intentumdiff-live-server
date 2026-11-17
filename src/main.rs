@@ -403,6 +403,10 @@ fn main() {
                             // Completeness was already judged by Rust Core's
                             // live_handle_diff_impl; this transport only shapes
                             // a successful response and never reclassifies it.
+                            // `diff` (core #252 `completeness`, `incomplete` with its
+                            // report, `metadata.equivalence_proof`) is forwarded verbatim;
+                            // the report URL is the client's to open after user
+                            // confirmation, never this server's.
                             let duration_ms =
                                 (start.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                             let change_count = diff
