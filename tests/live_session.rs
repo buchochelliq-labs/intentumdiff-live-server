@@ -54,15 +54,21 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn unique_temp_dir() -> PathBuf {
+    // Tests run in parallel. A timestamp alone is not unique: macOS and Windows clocks are
+    // coarser than a nanosecond, so two tests starting together got the same directory and
+    // their concurrent `git init` collided. A per-process counter makes every name unique,
+    // and create_dir (not create_dir_all) refuses a directory that already exists.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "intentumdiff-live-it-{}-{nanos}",
+        "intentumdiff-live-it-{}-{nanos}-{n}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("unique temp dir");
     dir
 }
 
@@ -170,6 +176,7 @@ fn native_live_server_serves_the_protocol() {
     assert_eq!(ready["capabilities"]["stream"], false);
     assert_eq!(ready["capabilities"]["review_streaming"], false);
     assert_eq!(ready["capabilities"]["edit_deltas"], false);
+    assert_eq!(ready["capabilities"]["cancel_interrupts"], false);
 
     // 2. hello echoes the protocol handshake.
     s.send(&json!({"op": "hello", "seq": 1}));
@@ -219,6 +226,8 @@ fn native_live_server_serves_the_protocol() {
     let cancel = s.recv();
     assert_eq!(cancel["op"], "cancel");
     assert_eq!(cancel["ok"], true);
+    assert_eq!(cancel["cancelled"], 0);
+    assert_eq!(cancel["interrupted"], false);
 
     std::fs::write(repo.join("card.png"), include_bytes!("fixtures/before.png")).unwrap();
     git(&repo, &["add", "card.png"]);
@@ -821,4 +830,229 @@ fn native_python_comment_only_edit_is_served_as_style_only() {
     assert_eq!(r["ok"], true, "comment-only Python edit must be served: {r}");
     assert_eq!(r["diff"]["is_style_only"], true, "{r}");
     assert_eq!(r["diff"]["has_semantic_changes"], false, "{r}");
+}
+
+// ---------------------------------------------------------------------------
+// #26: the EFFECTIVE startup configuration (project YAML, --config-json, --fuel) is
+// validated before `ready`; unknown keys, wrong types, out-of-range and unsupported
+// values fail with invalid_config (exit 2) instead of announcing readiness.
+// ---------------------------------------------------------------------------
+
+fn assert_config_rejected_naming(output: std::process::Output, needle: &str) {
+    assert_eq!(output.status.code(), Some(2), "invalid config must exit 2");
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(text.contains(needle), "error should name {needle:?}: {text}");
+    assert_config_rejected(output);
+}
+
+#[test]
+fn startup_rejects_invalid_config_json_before_ready() {
+    let repo = unique_temp_dir();
+    for (config, needle) in [
+        (r#"{"bogus_key":1}"#, "bogus_key"),
+        (r#"{"unknown_audit_key":1}"#, "unknown_audit_key"),
+        (r#"{"ignore_styel":true}"#, "ignore_styel"),
+        (r#"{"plugin_fuel":"x"}"#, "plugin_fuel"),
+        (r#"{"plugin_fuel":"bad"}"#, "plugin_fuel"),
+        (r#"{"min_similarity":2}"#, "min_similarity"),
+        (r#"{"max_nodes":-1}"#, "max_nodes"),
+        (r#"{"detect_refactorings":false}"#, "detect_refactorings"),
+        (r#"{"guardrails_enabled":"false"}"#, "guardrails_enabled"),
+        (r#"{"guardrail_policy_path":7}"#, "guardrail_policy_path"),
+        (r#"{"strict_plugins":"yes"}"#, "strict_plugins"),
+        (r#"{"allowed_plugins":"python"}"#, "allowed_plugins"),
+    ] {
+        assert_config_rejected_naming(startup(&repo, &["--config-json", config]), needle);
+    }
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn startup_rejects_invalid_project_yaml_values_before_ready() {
+    for (yaml, needle) in [
+        ("config:\n  plugin_fuel: bad\n", "plugin_fuel"),
+        ("config:\n  min_similarity: 2\n", "min_similarity"),
+        ("config:\n  detect_refactorings: false\n", "detect_refactorings"),
+        ("config:\n  bogus_key: 1\n", "bogus_key"),
+    ] {
+        let repo = unique_temp_dir();
+        std::fs::write(repo.join("intentumdiff.yaml"), yaml).unwrap();
+        assert_config_rejected_naming(startup(&repo, &[]), needle);
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+#[test]
+fn startup_accepts_valid_overrides_and_reports_the_effective_config() {
+    let repo = unique_temp_dir();
+    let output = startup(
+        &repo,
+        &[
+            "--config-json",
+            r#"{"min_similarity":0.7,"max_nodes":100,"guardrails_enabled":false,"detect_refactorings":true,"strict_plugins":true,"allowed_plugins":["python"]}"#,
+            "--fuel",
+            "1234",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let ready: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(ready["ok"], true, "{ready}");
+    assert_eq!(ready["config_source"], "flag");
+    assert_eq!(ready["config"]["min_similarity"], 0.7, "{ready}");
+    assert_eq!(ready["config"]["max_nodes"], 100);
+    assert_eq!(ready["config"]["plugin_fuel"], 1234);
+    assert_eq!(ready["config"]["guardrails_enabled"], false);
+    std::fs::write(repo.join("intentumdiff.yaml"), "config:\n  min_similarity: 0.6\n  plugin_fuel: 10_000\n").unwrap();
+    let ready: Value = serde_json::from_slice(&startup(&repo, &[]).stdout).unwrap();
+    assert_eq!(ready["ok"], true, "{ready}");
+    assert_eq!(ready["config_source"], "intentumdiff.yaml");
+    assert_eq!(ready["config"]["min_similarity"], 0.6, "{ready}");
+    assert_eq!(ready["config"]["plugin_fuel"], 10000);
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+// ── core #252: review completeness is forwarded verbatim ────────────────────────────────
+
+/// A committed `files` fixture; returns the repo.
+fn completeness_repo(files: &[(&str, &str)]) -> PathBuf {
+    assert!(git_available(), "git is required for protocol verification");
+    let base = unique_temp_dir();
+    git(&base, &["init"]);
+    git(&base, &["config", "user.email", "t@example.com"]);
+    git(&base, &["config", "user.name", "T"]);
+    for (path, text) in files {
+        std::fs::write(base.join(path), text).unwrap();
+    }
+    git(&base, &["add", "."]);
+    git(&base, &["commit", "-m", "base"]);
+    base
+}
+
+/// The three core #252 fields of a served review.
+fn completeness_fields(diff: &Value) -> Value {
+    json!({
+        "completeness": diff["completeness"],
+        "incomplete": diff["incomplete"],
+        "equivalence_proof": diff["metadata"]["equivalence_proof"],
+    })
+}
+
+/// The diff frame for `new` against the committed `old`, plus the linked core's own
+/// answer for the identical request (the server's startup config is `{}` here).
+fn diff_frame_and_core(path: &str, old: &str, new: &str) -> (Value, Value) {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let repo = completeness_repo(&[(path, old)]);
+    let mut session = spawn(env!("CARGO_BIN_EXE_intentumdiff-live-server"), &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "diff", "seq": 1, "path": path, "content": new, "ref": "HEAD"}));
+    let frame = session.recv();
+    drop(session.stdin);
+    let _ = session.child.wait();
+    let core: Value = serde_json::from_str(
+        &intentumdiff_rust_core::live_server::live_handle_diff_impl(
+            &repo.to_string_lossy(), path, "HEAD", new, "{}", &wasm_dir.to_string_lossy(),
+        ).expect("core diff"),
+    ).unwrap();
+    let _ = std::fs::remove_dir_all(repo);
+    (frame, core)
+}
+
+fn frame_keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// The transport envelope is the same for every completeness state: the review travels
+/// inside `diff` exactly as core produced it, and the server adds nothing of its own
+/// (in particular no URL handling: core never sends anything and neither does the server).
+fn assert_forwarded_verbatim(frame: &Value, core: &Value, completeness: &str) {
+    assert_eq!(frame["ok"], true, "{frame}");
+    assert_eq!(frame_keys(frame), ["diff", "metadata", "ok", "op", "seq"], "{frame}");
+    assert_eq!(
+        frame_keys(&frame["metadata"]),
+        ["change_count", "duration_ms", "guardrail_violation_count", "language", "style_only"],
+        "{frame}"
+    );
+    assert_eq!(frame["diff"]["completeness"], completeness, "{frame}");
+    assert_eq!(completeness_fields(&frame["diff"]), completeness_fields(&core["diff"]), "{frame}");
+}
+
+#[test]
+fn an_incomplete_review_frame_carries_the_core_fields_verbatim() {
+    // An array-element reorder the engine cannot explain (core #252): incomplete.
+    let (frame, core) = diff_frame_and_core("a.ts", "const a = [1, 2];\n", "const a = [2, 1];\n");
+    assert_forwarded_verbatim(&frame, &core, "incomplete");
+    let diff = &frame["diff"];
+    assert_eq!(diff["incomplete"], core["diff"]["incomplete"], "the whole object, verbatim");
+    let incomplete = &diff["incomplete"];
+    assert_eq!(incomplete["reason"], "unexplained_source_delta");
+    assert!(incomplete["message"].as_str().unwrap().contains("could not explain"));
+    assert!(!incomplete["source_ranges"].as_array().unwrap().is_empty(), "{incomplete}");
+    let report = &incomplete["report"];
+    for field in ["title", "body_markdown", "issue_url"] {
+        assert!(report[field].is_string(), "report.{field}: {report}");
+    }
+    assert!(report["truncated"].is_boolean() && report["outline"].is_object(), "{report}");
+    assert_eq!(incomplete["report_url"], report["issue_url"]);
+    // Core never fabricates changes for it, and the transport does not either.
+    assert_eq!(diff["changes"], json!([]));
+    assert_eq!(frame["metadata"]["change_count"], 0);
+}
+
+#[test]
+fn complete_and_equivalent_review_frames_are_unchanged() {
+    let (frame, core) =
+        diff_frame_and_core("a.ts", "const x: number = 1;\n", "const x: number = 2;\n");
+    assert_forwarded_verbatim(&frame, &core, "complete");
+    assert!(frame["diff"]["incomplete"].is_null(), "{frame}");
+    assert!(frame["metadata"]["change_count"].as_u64().unwrap() > 0, "{frame}");
+
+    // Byte-identical input is `complete`, never `equivalent`.
+    let (frame, core) = diff_frame_and_core("a.ts", "const x = 1;\n", "const x = 1;\n");
+    assert_forwarded_verbatim(&frame, &core, "complete");
+    assert!(frame["diff"]["incomplete"].is_null(), "{frame}");
+
+    // A proved equivalence (unordered mapping member order) keeps core's proof.
+    let (frame, core) =
+        diff_frame_and_core("a.json", "{\"a\": 1, \"b\": 2}\n", "{\"b\": 2, \"a\": 1}\n");
+    assert_forwarded_verbatim(&frame, &core, "equivalent");
+    assert!(frame["diff"]["incomplete"].is_null(), "{frame}");
+    assert!(frame["diff"]["metadata"]["equivalence_proof"].is_string(), "{frame}");
+}
+
+#[test]
+fn review_frames_forward_each_file_completeness_verbatim() {
+    let wasm_dir =
+        find_wasm_dir().expect("set INTENTUMDIFF_TEST_WASM_DIR to verified parser components");
+    let repo = completeness_repo(&[
+        ("lost.ts", "const a = [1, 2];\n"),
+        ("kept.ts", "const x: number = 1;\n"),
+    ]);
+    std::fs::write(repo.join("lost.ts"), "const a = [2, 1];\n").unwrap();
+    std::fs::write(repo.join("kept.ts"), "const x: number = 2;\n").unwrap();
+    let mut session = spawn(env!("CARGO_BIN_EXE_intentumdiff-live-server"), &repo, &wasm_dir);
+    assert_eq!(session.recv()["op"], "ready");
+    session.send(&json!({"op": "review", "seq": 1, "old_ref": "HEAD"}));
+    let frame = session.recv();
+    drop(session.stdin);
+    let _ = session.child.wait();
+    let core: Value = serde_json::from_str(
+        &intentumdiff_rust_core::live_server::live_handle_review_impl(
+            &repo.to_string_lossy(), "HEAD", "", "{}", &wasm_dir.to_string_lossy(),
+        ).expect("core review"),
+    ).unwrap();
+    let _ = std::fs::remove_dir_all(&repo);
+    assert_eq!(frame["ok"], true, "{frame}");
+    let by_name = |v: &Value, name: &str| -> Value {
+        v["commit_diff"]["file_diffs"].as_array().unwrap().iter()
+            .find(|f| f["new_filename"] == name).cloned()
+            .unwrap_or_else(|| panic!("{name} missing: {v}"))
+    };
+    for (name, state) in [("lost.ts", "incomplete"), ("kept.ts", "complete")] {
+        let served = by_name(&frame, name);
+        assert_eq!(served["completeness"], state, "{name}: {served}");
+        assert_eq!(completeness_fields(&served), completeness_fields(&by_name(&core, name)), "{name}");
+    }
 }
